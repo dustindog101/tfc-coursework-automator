@@ -25,5 +25,8 @@ models.txt
 *.html
 _coursework_*
 
+# Local scratch & temp files
+scratch/
+
 # OS
 .DS_Store
