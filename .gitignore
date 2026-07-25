@@ -1,0 +1,29 @@
+# Secrets & local config
+.env
+.auth_state.json
+
+# Runtime logs & state
+automation.log
+events.jsonl
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Playwright / browser caches
+.playwright/
+
+# Local dev / exploration artifacts (may contain session data)
+explore_site*.py
+smoke_test.py
+test_flash.txt
+models.txt
+*.png
+*.html
+_coursework_*
+
+# OS
+.DS_Store
