@@ -72,12 +72,21 @@ When the platform's 8.0h/day limit is reached, the bot notifies you, enters a lo
 🌙 [LIMIT_WAIT] ⏱ 09h 33m remaining until daily reset (00:00:00). Waiting...
 ```
 
+### 4. Native macOS Menu Bar Status App 🍏
+Prefer a clean menu bar interface? Launch `./run_menubar.sh` for a lightweight macOS status bar app (`menubar.py`) that lives in your top panel:
+- **Live Menu Title**: Shows current lesson & timer (e.g. `📖 29m 45s | 18.8/75h` or `🌙 Reset in 09h 15m`).
+- **Active Timers Submenu**: Track Article Reading, Submit-Lock, and Daily Limit Reset timers simultaneously.
+- **Upcoming AI Reflection Draft**: Preview the pre-generated AI essay and copy it to your clipboard with 1 click (`📋 Copy Reflection`).
+- **1-Click Control**: Toggle the bot process on/off directly from the menu bar (`▶️ Start Automator` / `⏸️ Stop Automator`).
+- **Live History**: Scrollable history of the latest completed lessons and progress events.
+
 ---
 
 ## ✨ Key Features
 
 | Feature | Description |
 | :--- | :--- |
+| **🍏 Native macOS Menu Bar App** | Built on PyObjC (`rumps`) using < 15MB RAM and 30KB disk. Shows live timers, upcoming reflections, profile stats, and history. |
 | **🧠 Asynchronous AI Reflections** | Uses Gemini 3.6 Flash via `agy` CLI to write authentic, college-freshman level reflections (80–295 chars, no em dashes, casual tone) in background threads during reading timers. |
 | **🔍 Smart Catalog Discovery** | Scrapes `/coursework` to categorize lessons into *Done*, *Needs Reading*, and *Needs Reflection*, allowing instant resume after interruptions. |
 | **⏱️ Dual Timer Support** | Intelligently handles both the **article reading countdown** and the **reflection submit-lock timer** on the page. |
@@ -134,16 +143,19 @@ TFC_PASSWORD=your-password
 TFC_DAILY_HOUR_LIMIT=8.0
 ```
 
-### 3. Launch the Bot
+### 3. Launch the Automator
 
-Run in **Headed Mode** (visible Chromium browser) with auto-recovery wrapper:
+**Option A: Launch Native macOS Menu Bar App (Recommended)**
+```bash
+./run_menubar.sh
+```
 
+**Option B: Launch Terminal Runner (Headed / Visible Browser)**
 ```bash
 ./run.sh
 ```
 
-To run in **Headless Mode** (hidden background browser):
-
+**Option C: Launch Terminal Runner (Headless / Background Browser)**
 ```bash
 HEADED=0 ./run.sh
 ```
