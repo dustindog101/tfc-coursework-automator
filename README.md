@@ -9,6 +9,7 @@
     <a href="https://deepmind.google/technologies/gemini/"><img src="https://img.shields.io/badge/AI_Powered-Gemini_3.6_Flash-purple.svg?style=for-the-badge&logo=google-gemini" alt="AI Powered"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="License MIT"></a>
     <a href="#-privacy--security-guarantee"><img src="https://img.shields.io/badge/Privacy-Zero_PII_Tracked-brightgreen.svg?style=for-the-badge&logo=lock" alt="Privacy"></a>
+    <a href="ROADMAP.md"><img src="https://img.shields.io/badge/Roadmap-Multi--Account_Host-blueviolet.svg?style=for-the-badge" alt="Roadmap"></a>
   </p>
 
   **An intelligent, hands-free automation suite that completes CBT community service coursework on [The Foundation of Change](https://www.thefoundationofchange.org).**
@@ -97,6 +98,19 @@ Prefer a clean menu bar interface? Launch `./run_menubar.sh` for a lightweight m
 | **🌙 Daily Limit Auto-Wait** | Detects when today's 8.0h limit is reached, notifies you, displays a live reset countdown, and resumes automatically at midnight. |
 | **🔄 Anti-Logout Keep-Alive** | Executes subtle micro-scrolls every 2.75 minutes to keep Supabase SPA authentication tokens fresh indefinitely. |
 | **📊 JSONL Auditing** | Produces clean human-readable logs (`automation.log`) and machine-auditable JSON events (`events.jsonl`). |
+
+---
+
+## 🗺️ Multi-Account & Host Manager Roadmap
+
+Need to automate coursework for users who don't have dedicated computers? The **Multi-Account Host Manager** architecture allows a single machine to host and run up to **20 independent account automators** concurrently:
+
+- 👥 **Host Mode for Friends & Family**: Manage coursework automation for users without a machine.
+- ⚡ **Concurrent Worker Pool (`orchestrator.py`)**: Spawns up to 20 lightweight headless Chromium instances (<80MB RAM each) with staggered execution.
+- 🍏 **Multi-User Menu Bar App**: Switch active menu bar focus between accounts, view an overview status grid of all 20 workers (`3 Active / 2 Limit Wait / 0 Paused`), and manage start/pause controls across all accounts.
+- 🌐 **Remote Web Request Portal**: Non-technical account owners can log in to check progress or request automation jobs remotely.
+
+👉 Read the full roadmap specification in [ROADMAP.md](ROADMAP.md).
 
 ---
 
