@@ -1,24 +1,34 @@
-# 🚀 Foundation of Change Coursework Automator
+<div align="center">
+  <img src="tfc_hero_banner.jpg" alt="TFC Automator Hero Banner" width="800"/>
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Playwright](https://img.shields.io/badge/Playwright-Automated_Browser-green.svg)](https://playwright.dev/python/)
-[![AI Powered](https://img.shields.io/badge/AI_Powered-Gemini_3.6_Flash-purple.svg)](https://deepmind.google/technologies/gemini/)
-[![License MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Privacy](https://img.shields.io/badge/Privacy-Zero_PII_Tracked-brightgreen.svg)](#-privacy--security-guarantee)
+  # 🚀 Foundation of Change Coursework Automator
 
-An intelligent, hands-free automation suite that completes CBT community service coursework on **[The Foundation of Change](https://www.thefoundationofchange.org)**. It automatically handles initial reading timers, generates authentic AI reflections, manages submit-lock timers, keeps sessions active, and enforces daily hour limits—**saving you 75+ hours of tedious manual clicking**.
+  <p align="center">
+    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=for-the-badge&logo=python" alt="Python 3.10+"></a>
+    <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-Automated_Browser-green.svg?style=for-the-badge&logo=playwright" alt="Playwright"></a>
+    <a href="https://deepmind.google/technologies/gemini/"><img src="https://img.shields.io/badge/AI_Powered-Gemini_3.6_Flash-purple.svg?style=for-the-badge&logo=google-gemini" alt="AI Powered"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge" alt="License MIT"></a>
+    <a href="#-privacy--security-guarantee"><img src="https://img.shields.io/badge/Privacy-Zero_PII_Tracked-brightgreen.svg?style=for-the-badge&logo=lock" alt="Privacy"></a>
+  </p>
+
+  **An intelligent, hands-free automation suite that completes CBT community service coursework on [The Foundation of Change](https://www.thefoundationofchange.org).**
+  <br/>
+  *It automatically handles initial reading timers, generates authentic AI reflections, manages submit-lock timers, keeps sessions active, and enforces daily hour limits—saving you 75+ hours of tedious manual clicking.*
+
+</div>
 
 ---
 
 ## 🌟 Why Use This Automator?
 
-Completing 75 required hours of community service coursework manually is exhausting:
+Completing 75 required hours of community service coursework manually is exhausting. You are forced to deal with:
 - ⏳ Sitting through **hundreds of 30–60 minute reading and reflection timers**.
 - 🖱️ Constantly clicking and scrolling every 2–3 minutes to prevent frustrating session logouts.
-- ✍️ Writing hundreds of unique reflection responses under character-length restrictions.
+- ✍️ Writing hundreds of unique reflection responses under strict character-length restrictions.
 - ⏰ Tracking complex daily hour caps (8.0h/day) to ensure no effort is wasted.
 
-### 💡 The Solution
+### 💡 The Solution: Zero Effort, High Impact
+
 This bot automates the entire coursework lifecycle end-to-end:
 1. **Save 75+ Hours**: Let the bot run silently in the background while you study, work, or sleep.
 2. **Instant Submissions**: AI reflections are generated in the background *while* reading timers run, so forms submit the exact second timers reach zero.
@@ -38,13 +48,7 @@ Upon login, the automator scrapes and displays a complete profile and coursework
 • FULL NAME                     : Jane Doe
 • EMAIL (READ-ONLY)             : user@example.com
 • DATE OF BIRTH                 : 2000-01-01
-• GENDER                        : Prefer not to say
 • COMMUNITY SERVICE RELATED TO  : General / Personal Growth
-• ADDRESS                       : 123 Main St
-• CITY                          : Springfield
-• STATE                         : Illinois
-• ZIP CODE                      : 62701
-• ENROLLMENT PROOF ID           : a1b2c3d4-e5f6-7890-abcd-ef1234567890
 • OVERALL PROGRESS              : 18.8h / 75.0h total (25% Complete)
 • HOURS REMAINING               : 56.2h
 ============================================================
@@ -82,39 +86,35 @@ Prefer a clean menu bar interface? Launch `./run_menubar.sh` for a lightweight m
 
 ---
 
-## ✨ Key Features
+## ✨ Key Features Breakdown
 
 | Feature | Description |
 | :--- | :--- |
 | **🍏 Native macOS Menu Bar App** | Built on PyObjC (`rumps`) using < 15MB RAM and 30KB disk. Shows live timers, upcoming reflections, profile stats, and history. |
-| **🧠 Asynchronous AI Reflections** | Uses Gemini 3.6 Flash via `agy` CLI to write authentic, college-freshman level reflections (80–295 chars, no em dashes, casual tone) in background threads during reading timers. |
+| **🧠 Asynchronous AI Reflections** | Uses Gemini 3.6 Flash via `agy` CLI to write authentic, college-freshman level reflections (80–295 chars, no em dashes, casual tone) in background threads. |
 | **🔍 Smart Catalog Discovery** | Scrapes `/coursework` to categorize lessons into *Done*, *Needs Reading*, and *Needs Reflection*, allowing instant resume after interruptions. |
 | **⏱️ Dual Timer Support** | Intelligently handles both the **article reading countdown** and the **reflection submit-lock timer** on the page. |
 | **🌙 Daily Limit Auto-Wait** | Detects when today's 8.0h limit is reached, notifies you, displays a live reset countdown, and resumes automatically at midnight. |
 | **🔄 Anti-Logout Keep-Alive** | Executes subtle micro-scrolls every 2.75 minutes to keep Supabase SPA authentication tokens fresh indefinitely. |
-| **📊 Dual Logging System** | Produces clean human-readable logs (`automation.log`) and machine-auditable JSON events (`events.jsonl`). |
+| **📊 JSONL Auditing** | Produces clean human-readable logs (`automation.log`) and machine-auditable JSON events (`events.jsonl`). |
 
 ---
 
-## 🔄 How It Works
+## 🔄 Architecture & Lifecycle Workflow
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│  Log in to TFC  ├────►│ Scrape Profile & ├────►│ Build Coursework │
-│   Credentials   │     │ Progress Stats   │     │  Catalog Queue   │
-└─────────────────┘     └──────────────────┘     └────────┬─────────┘
-                                                          │
-┌─────────────────┐     ┌──────────────────┐              │
-│ Submit & Continue◄────┤ Reflect Phase &  │◄─────────────┘
-│ Next Lesson     │     │ Submit-Lock Wait │
-└────────┬────────┘     └──────────────────┘
-         │
-         ▼
-┌────────────────────────────────────────────────────────┐
-│ Daily Limit (8h) Reached?                              │
-│  ├── YES ──► Log Banner ──► Wait until 00:00 ──► Resume│
-│  └── NO  ──► Continue Next Lesson                      │
-└────────────────────────────────────────────────────────┘
+```mermaid
+graph TD;
+    A[Log in to TFC Credentials] --> B[Scrape Profile & Progress Stats]
+    B --> C[Build Coursework Catalog Queue]
+    C --> D[Lesson Phase: Read & Reflect]
+    
+    D --> E{Daily Limit 8h Reached?}
+    E -- YES --> F[Log Banner & Wait until 00:00]
+    F --> G[Midnight Reset]
+    G --> D
+    
+    E -- NO --> H[Submit & Continue Next Lesson]
+    H --> D
 ```
 
 ---
