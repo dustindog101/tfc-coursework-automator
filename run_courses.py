@@ -999,8 +999,8 @@ async def wait_for_daily_reset(page, rs: RunState):
                 log.info("🌅 Daily limit reset confirmed! Resuming coursework...")
                 break
             else:
-                log.info("⏳ Reset not updated on site yet; waiting 5 more minutes...")
-                await page.wait_for_timeout(300000)
+                log.info("⏳ Midnight reached! Reset not updated on site yet; retrying in 2 minutes...")
+                await page.wait_for_timeout(120000)
 
         try:
             if int(time.time()) % 120 == 0:
