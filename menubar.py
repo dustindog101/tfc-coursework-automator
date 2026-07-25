@@ -477,11 +477,11 @@ class TFCCourseworkMenuApp(rumps.App):
             # Title format: 🌙 Reset in 07h 42m | 8.0/8h (Assume they meant done_today/8.0h or something, 
             # but standard is done/total, let's use done/total for consistency if not we can use 8.0/8h)
             if is_retrying_after_midnight and diff_s == 0:
-                self.title = f"🔄 Reset Check (2m Retry) | {done}/{total}h"
+                self.title = f"🔄 Reset Check (2m Retry) | {done:.1f}/{total:g}h"
                 self.item_status.title = "🌙 Limit Wait - Retrying Reset"
                 self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
-                self.title = f"🌙 Reset in {calc_reset_str} | 8.0/8h"
+                self.title = f"🌙 Reset in {calc_reset_str} | {done:.1f}/{total:g}h"
                 self.item_status.title = "🌙 Limit Wait"
                 self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
                 
@@ -490,20 +490,20 @@ class TFCCourseworkMenuApp(rumps.App):
         elif bot_active:
             new_state_id = "ACTIVE"
             if read_timer_str != "N/A":
-                self.title = f"🟢 {read_timer_str} | {done}/{total}h"
+                self.title = f"🟢 {read_timer_str} | {done:.1f}/{total:g}h"
             elif submit_timer_str != "N/A":
-                self.title = f"🟢 Submit {submit_timer_str} | {done}/{total}h"
+                self.title = f"🟢 Submit {submit_timer_str} | {done:.1f}/{total:g}h"
             else:
-                self.title = f"🟢 Active | {done}/{total}h"
+                self.title = f"🟢 Active | {done:.1f}/{total:g}h"
                 
             self.item_status.title = "🟢 Active"
             self.item_queue_today.title = f"Logged Today: Processing ({done}h total)"
             
         else:
             new_state_id = "IDLE"
-            self.title = f"⏸️ Idle | {done}/{total}h"
+            self.title = f"⏸️ Paused | {done:.1f}/{total:g}h"
             self.item_status.title = "⏸️ Paused"
-            self.item_queue_today.title = f"Logged Today: Paused ({done}h total)"
+            self.item_queue_today.title = f"Logged Today: Paused ({done:.1f}h total)"
 
         self.item_queue_lesson.title = f"Active Lesson: {self.current_lesson}"
         self.item_read_timer.title = f"• Reading Timer: {read_timer_str}"
