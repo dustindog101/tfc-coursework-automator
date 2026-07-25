@@ -130,6 +130,19 @@ jq 'select(.event=="lesson_complete")' events.jsonl   # completed lessons
 
 ---
 
+## For AI agents
+
+Hand a Cursor/agent this skill and say: **use the tfc-coursework-bot skill**.
+
+| File | Purpose |
+|------|---------|
+| [`.cursor/skills/tfc-coursework-bot/SKILL.md`](.cursor/skills/tfc-coursework-bot/SKILL.md) | How to set up, run, monitor, restart, and what not to do |
+| [`.cursor/skills/tfc-coursework-bot/state-cases.md`](.cursor/skills/tfc-coursework-bot/state-cases.md) | Mid-work detection: Done / Continue / Start, read vs reflect, crash resume |
+
+The bot **already** detects mid-lesson state (reading timer still going, needs reflect only, already submitted, etc.). Agents should run `./run.sh` and monitor — not reinvent the flow.
+
+---
+
 ## Disclaimer
 
 Educational tool. Use responsibly and in accordance with the platform's terms of service.

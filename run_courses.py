@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -114,11 +114,16 @@ def get_today_hours_from_log() -> float:
 
 
 def parse_daily_remaining(body: str) -> Optional[float]:
-    """Parse '3.9h remaining today (8h max)' from coursework/dashboard."""
+    """Parse '3.9h remaining today (8h max)' or '0.0h daily limit reached' from coursework/dashboard."""
+    if re.search(r"daily limit reached", body, re.IGNORECASE):
+        return 0.0
+
     for pat in [
+        r"TODAY'S LIMIT\s*\n\s*([\d.]+)\s*h",
         r"([\d.]+)\s*h\s*\n\s*remaining today",
         r"remaining today[^\d]*([\d.]+)\s*h",
-        r"TODAY'S LIMIT\s*\n\s*([\d.]+)\s*h\s*\n\s*remaining",
+        r"([\d.]+)\s*h\s*\n\s*daily limit reached",
+        r"([\d.]+)\s*h\s*\n\s*remaining",
     ]:
         m = re.search(pat, body, re.IGNORECASE)
         if m:
@@ -130,6 +135,7 @@ async def get_daily_status(page) -> dict:
     """Read today's hours from the site (source of truth) with log fallback."""
     hours_from_log = get_today_hours_from_log()
     remaining_today = None
+    site_limit_reached = False
     try:
         await page.goto(f"{BASE_URL}/coursework", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
@@ -138,22 +144,32 @@ async def get_daily_status(page) -> dict:
             await page.goto(f"{BASE_URL}/coursework", wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
         body = await page.inner_text("body")
-        remaining_today = parse_daily_remaining(body)
+        if re.search(r"daily limit reached", body, re.IGNORECASE):
+            site_limit_reached = True
+            remaining_today = 0.0
+        else:
+            remaining_today = parse_daily_remaining(body)
     except Exception as e:
         log.warning(f"Could not read daily limit from site: {e}")
 
     if remaining_today is not None:
         hours_today = max(0.0, DAILY_HOUR_LIMIT - remaining_today)
+        if site_limit_reached or remaining_today <= 0:
+            hours_today = DAILY_HOUR_LIMIT
+            remaining_today = 0.0
         return {
             "hours_today": hours_today,
             "hours_remaining_today": remaining_today,
+            "site_limit_reached": site_limit_reached,
             "source": "site",
         }
 
     remaining = max(0.0, DAILY_HOUR_LIMIT - hours_from_log)
+    limit_reached = (hours_from_log >= DAILY_HOUR_LIMIT or remaining <= 0)
     return {
         "hours_today": hours_from_log,
         "hours_remaining_today": remaining,
+        "site_limit_reached": limit_reached,
         "source": "log",
     }
 
@@ -828,7 +844,79 @@ def check_daily_limit(hours_today: float, hours_remaining: Optional[float] = Non
     return False
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+async def wait_for_daily_reset(page, rs: RunState):
+    """
+    Called when daily limit (8.0h) is reached.
+    Notifies the user and waits until midnight local time (00:00:00) or until site limit resets.
+    """
+    now = datetime.now()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    secs_until_midnight = int((tomorrow - now).total_seconds())
+
+    h_str = f"{secs_until_midnight // 3600}h {(secs_until_midnight % 3600) // 60}m {secs_until_midnight % 60}s"
+
+    log.info("=" * 60)
+    log.info("⛔ DAILY LIMIT REACHED ON PLATFORM (8.0h / 8.0h max for today)")
+    log.info(f"📅 Today's Logged Hours: {rs.hours_today:.1f}h")
+    log.info(f"📊 Overall Progress: {rs.hours_done:.1f}h / {rs.hours_total:.1f}h total")
+    log.info("🔔 USER NOTIFICATION: Daily limit reached. Bot will wait for reset and resume automatically.")
+    log.info(f"⏰ Next reset estimated at local midnight ({tomorrow.strftime('%Y-%m-%d 00:00:00')}).")
+    log.info(f"⏳ Time until reset: {h_str}")
+    log.info("=" * 60)
+
+    log_event("daily_limit_wait_start", seconds_until_midnight=secs_until_midnight, reset_target=tomorrow.isoformat())
+
+    start_time = time.time()
+    last_check_time = time.time()
+    last_notify_time = 0.0
+
+    while True:
+        now = datetime.now()
+        secs_remaining = max(0, int((tomorrow - now).total_seconds()))
+
+        live_status(
+            "LIMIT_WAIT", secs_remaining, "Daily Limit Reached - Waiting for Reset",
+            rs.hours_done, rs.hours_today, rs.hours_total, rs
+        )
+
+        if time.time() - last_notify_time >= 600:
+            last_notify_time = time.time()
+            rem_h = secs_remaining // 3600
+            rem_m = (secs_remaining % 3600) // 60
+            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (00:00:00). Waiting...")
+
+        if time.time() - last_check_time >= 900:
+            last_check_time = time.time()
+            log.info("🔍 Periodic check: inspecting daily limit status on site...")
+            daily = await get_daily_status(page)
+            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached"):
+                log.info(f"🌅 Site daily limit reset detected! ({daily['hours_remaining_today']:.1f}h remaining today)")
+                break
+
+        if secs_remaining <= 0:
+            log.info("🌅 Local midnight reached! Checking daily limit status on site...")
+            await page.wait_for_timeout(5000)
+            daily = await get_daily_status(page)
+            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached"):
+                log.info("🌅 Daily limit reset confirmed! Resuming coursework...")
+                break
+            else:
+                log.info("⏳ Reset not updated on site yet; waiting 5 more minutes...")
+                await page.wait_for_timeout(300000)
+
+        try:
+            if int(time.time()) % 120 == 0:
+                await page.evaluate("window.scrollBy(0, 100)")
+                await page.wait_for_timeout(300)
+                await page.evaluate("window.scrollBy(0, -100)")
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(25000)
+
+    log_event("daily_limit_wait_complete", waited_seconds=int(time.time() - start_time))
+
+
 async def process_lesson(
     page, lesson: LessonEntry, hours_today: float, rs: RunState,
 ) -> tuple[bool, float]:
@@ -911,10 +999,6 @@ async def main():
             f"(source: {daily['source']})"
         )
 
-        if check_daily_limit(hours_today, hours_remaining_today):
-            await browser.close()
-            return
-
         prog = await get_progress(page)
         log.info(
             f"📊 Overall: {prog['done']}h / {prog['total']}h  "
@@ -922,19 +1006,22 @@ async def main():
         )
         log_event("progress_snapshot", **prog)
 
+        rs = RUN_STATE
+        rs.hours_done = prog["done"]
+        rs.hours_total = prog["total"]
+        rs.hours_today = hours_today
+
+        if check_daily_limit(hours_today, hours_remaining_today):
+            await wait_for_daily_reset(page, rs)
+
         if prog["remaining"] <= 0:
             log.info("🎉 All hours complete!")
             await browser.close()
             return
 
-        hours_today = daily["hours_today"]
         session_done = 0
         processed_urls: set[str] = set()
         consecutive_errors = 0
-        rs = RUN_STATE
-        rs.hours_done = prog["done"]
-        rs.hours_total = prog["total"]
-        rs.hours_today = hours_today
 
         while True:
             daily = await get_daily_status(page)
@@ -943,7 +1030,8 @@ async def main():
             rs.hours_today = hours_today
 
             if check_daily_limit(hours_today, hours_remaining_today):
-                break
+                await wait_for_daily_reset(page, rs)
+                continue
 
             lessons, cta_url = await fetch_coursework_catalog(page)
             if not lessons:
