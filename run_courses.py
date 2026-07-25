@@ -958,7 +958,7 @@ async def wait_for_daily_reset(page, rs: RunState):
     log.info(f"📅 Today's Logged Hours: {rs.hours_today:.1f}h")
     log.info(f"📊 Overall Progress: {rs.hours_done:.1f}h / {rs.hours_total:.1f}h total")
     log.info("🔔 USER NOTIFICATION: Daily limit reached. Bot will wait for reset and resume automatically.")
-    log.info(f"⏰ Next reset estimated at local midnight ({tomorrow.strftime('%Y-%m-%d 00:00:00')}).")
+    log.info(f"⏰ Next reset estimated at local midnight ({tomorrow.strftime('%Y-%m-%d 12:00:00 AM')} local time).")
     log.info(f"⏳ Time until reset: {h_str}")
     log.info("=" * 60)
 
@@ -981,7 +981,7 @@ async def wait_for_daily_reset(page, rs: RunState):
             last_notify_time = time.time()
             rem_h = secs_remaining // 3600
             rem_m = (secs_remaining % 3600) // 60
-            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (00:00:00). Waiting...")
+            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (12:00 AM local time). Waiting...")
 
         if time.time() - last_check_time >= 900:
             last_check_time = time.time()

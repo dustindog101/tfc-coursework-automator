@@ -2,16 +2,6 @@
 """
 TFC Coursework Automator — Lightweight macOS Menu Bar App
 Built with rumps (PyObjC native Cocoa NSStatusItem). Ultra-lightweight (<15MB RAM, 30KB disk).
-
-Features:
-- Headless Mode by Default (background browser execution)
-- Editable Settings & Configuration Submenu
-- Native Start on macOS Login (LaunchAgent integration)
-- Lightweight Watchdog Engine (auto-restarts runner on crash)
-- Live Menu Bar Title & Countdown Timers
-- Upcoming AI Reflection Draft Preview & 1-Click Clipboard Copy
-- Comprehensive User Account Profile & Coursework Audit
-- Real-time Event History Stream
 """
 
 import os
@@ -29,6 +19,19 @@ LOG_FILE = os.path.join(ROOT_DIR, "automation.log")
 SCRIPT_PATH = os.path.join(ROOT_DIR, "run_courses.py")
 ENV_FILE = os.path.join(ROOT_DIR, ".env")
 LAUNCH_AGENT_PATH = os.path.expanduser("~/Library/LaunchAgents/com.tfc.automator.plist")
+
+
+def format_local_time(ts_iso_str: str) -> str:
+    """Parse ISO timestamp and return user's 12-hour local time (e.g. '3:45 PM')."""
+    if not ts_iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts_iso_str)
+        return dt.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        if len(ts_iso_str) >= 16:
+            return ts_iso_str[11:16]
+        return ts_iso_str
 
 
 class TFCCourseworkMenuApp(rumps.App):
@@ -53,7 +56,7 @@ class TFCCourseworkMenuApp(rumps.App):
         # ── 1. Status & Mode Header ──────────────────────────────────────────
         self.item_mode = rumps.MenuItem("⚙️ Mode: Headless (Background Browser)", callback=None)
         self.item_status = rumps.MenuItem("📌 Status: Idle", callback=None)
-        self.item_retry = rumps.MenuItem("⏰ Reset Policy: 00:00 midnight with 2m retry", callback=None)
+        self.item_retry = rumps.MenuItem("⏰ Reset Policy: 12:00 AM local midnight with 2m retry", callback=None)
         
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
@@ -373,29 +376,29 @@ class TFCCourseworkMenuApp(rumps.App):
                         self.upcoming_reflection = refl
                         break
                         
-            # Event history items (last 10)
+            # Event history items formatted in 12-hour local time
             history_items = []
             for ev in reversed(events[-15:]):
-                ts = ev.get("ts", "")
-                time_str = ts[11:16] if len(ts) >= 16 else ""
+                time_str = format_local_time(ev.get("ts", ""))
+                t_prefix = f"[{time_str}] " if time_str else ""
                 event_name = ev.get("event", "event")
                 
                 if event_name == "user_profile_loaded":
-                    history_items.append(f"[{time_str}] 👤 Account Profile Loaded")
+                    history_items.append(f"{t_prefix}👤 Account Profile Loaded")
                 elif event_name == "progress_snapshot":
-                    history_items.append(f"[{time_str}] 📊 Progress Snapshot ({ev.get('done')}h/{ev.get('total')}h)")
+                    history_items.append(f"{t_prefix}📊 Progress Snapshot ({ev.get('done')}h/{ev.get('total')}h)")
                 elif event_name == "lesson_start":
-                    history_items.append(f"[{time_str}] 📖 Started Lesson: {ev.get('lesson_title', 'Lesson')[:25]}")
+                    history_items.append(f"{t_prefix}📖 Started Lesson: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "reflection_generated":
-                    history_items.append(f"[{time_str}] 📝 AI Reflection Ready ({ev.get('chars')} chars)")
+                    history_items.append(f"{t_prefix}📝 AI Reflection Ready ({ev.get('chars')} chars)")
                 elif event_name == "lesson_complete":
-                    history_items.append(f"[{time_str}] ✅ Completed: {ev.get('lesson_title', 'Lesson')[:25]}")
+                    history_items.append(f"{t_prefix}✅ Completed: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "daily_limit_hit":
-                    history_items.append(f"[{time_str}] ⛔ Daily Limit Hit ({ev.get('hours_today')}h/8.0h)")
+                    history_items.append(f"{t_prefix}⛔ Daily Limit Hit ({ev.get('hours_today')}h/8.0h)")
                 elif event_name == "daily_limit_wait_start":
-                    history_items.append(f"[{time_str}] 🌙 Waiting for Midnight Reset")
+                    history_items.append(f"{t_prefix}🌙 Waiting for Midnight Reset")
                 elif event_name == "bot_start":
-                    history_items.append(f"[{time_str}] 🚀 Bot Engine Started")
+                    history_items.append(f"{t_prefix}🚀 Bot Engine Started")
                     
             if history_items:
                 self.menu_history.clear()
@@ -465,7 +468,7 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception:
                 pass
 
-        # Calculate time until local midnight (00:00:00)
+        # Calculate time until local midnight (12:00 AM local time)
         now = datetime.now()
         midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         diff_s = max(0, int((midnight - now).total_seconds()))
@@ -482,12 +485,12 @@ class TFCCourseworkMenuApp(rumps.App):
                 self.item_limit_timer.title = "• Daily Midnight Reset: Retrying every 2 minutes..."
             else:
                 self.title = f"🌙 Reset in {h_rem:02d}h {m_rem:02d}m | {done}/{total}h"
-                self.item_status.title = "📌 Status: 🌙 Daily Limit Reached (Auto-resuming at 00:00:00)"
-                self.item_limit_timer.title = f"• Daily Midnight Reset: {calc_reset_str} (Target: 00:00)"
+                self.item_status.title = "📌 Status: 🌙 Daily Limit Reached (Auto-resuming at 12:00 AM local time)"
+                self.item_limit_timer.title = f"• Daily Midnight Reset: {calc_reset_str} (Target: 12:00 AM Local)"
                 
             self.item_prof_today.title = "• Today's Logged: 8.0h / 8.0h (Limit Reached)"
             self.item_queue_today.title = "Logged Today: 8.0h / 8.0h (Daily Limit Reached)"
-            self.item_retry.title = "⏰ Reset Policy: Resumes at 00:00 local time (2m retry if delayed)"
+            self.item_retry.title = "⏰ Reset Policy: Resumes at 12:00 AM local time (2m retry if delayed)"
 
         elif bot_active:
             if read_timer_str != "N/A":
@@ -509,7 +512,7 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_status.title = "📌 Status: ⏸️ Automator Paused / Idle"
             self.item_prof_today.title = f"• Today's Logged: {done}h / 8.0h"
             self.item_queue_today.title = f"Logged Today: Paused ({done}h total)"
-            self.item_retry.title = "⏰ Reset Policy: 00:00 midnight with 2m retry"
+            self.item_retry.title = "⏰ Reset Policy: 12:00 AM local midnight with 2m retry"
 
         self.item_queue_lesson.title = f"Active Lesson: {self.current_lesson}"
         self.item_read_timer.title = f"• Article Reading Timer: {read_timer_str}"
