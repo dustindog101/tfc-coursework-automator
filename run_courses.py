@@ -844,6 +844,106 @@ def check_daily_limit(hours_today: float, hours_remaining: Optional[float] = Non
     return False
 
 
+async def get_user_profile(page) -> dict:
+    """Scrape user info (Name, Email, DOB, Course Category, Address, Enrollment ID) from dashboard/profile."""
+    info = {
+        "name": "",
+        "email": EMAIL,
+        "dob": "",
+        "reason": "",
+        "address": "",
+        "enrollment_id": "",
+    }
+    try:
+        await safe_goto(page, f"{BASE_URL}/dashboard")
+        await page.wait_for_timeout(1000)
+        text = await page.inner_text("body")
+
+        m_name = re.search(r"Welcome back,\s*([^\n\r]+)", text, re.IGNORECASE)
+        if m_name:
+            info["name"] = m_name.group(1).strip()
+
+        proof_link = page.locator("a[href*='/api/enrollment-proof/']")
+        if await proof_link.count() > 0:
+            href = await proof_link.first.get_attribute("href") or ""
+            m_id = re.search(r"/enrollment-proof/([^/]+)", href)
+            if m_id:
+                info["enrollment_id"] = m_id.group(1)
+
+        await safe_goto(page, f"{BASE_URL}/dashboard/profile")
+        await page.wait_for_timeout(1000)
+
+        dob_el = page.locator("input[type='date']").first
+        if await dob_el.count() > 0:
+            info["dob"] = await dob_el.input_value()
+
+        email_el = page.locator("input[type='email']").first
+        if await email_el.count() > 0:
+            val = await email_el.input_value()
+            if val:
+                info["email"] = val
+
+        selects = await page.locator("select").all()
+        for sel in selects:
+            try:
+                opt_txt = await sel.evaluate("el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : ''")
+                if opt_txt and opt_txt not in ["Select...", "Select Language", "Select", "Prefer not to say", "Male", "Female", "Non-binary"]:
+                    info["reason"] = opt_txt
+                    break
+            except Exception:
+                pass
+
+        if not info["name"]:
+            try:
+                full_name = await page.locator("input").nth(1).input_value()
+                if full_name:
+                    info["name"] = full_name
+            except Exception:
+                pass
+
+        addr_parts = []
+        for idx in range(8, 12):
+            try:
+                el = page.locator("input").nth(idx)
+                if await el.count() > 0:
+                    val = await el.input_value()
+                    if val and len(val) < 60:
+                        addr_parts.append(val)
+            except Exception:
+                pass
+        if addr_parts:
+            info["address"] = ", ".join(addr_parts)
+
+    except Exception as e:
+        log.warning(f"Could not scrape detailed user profile: {e}")
+
+    return info
+
+
+def log_user_profile(user_info: dict, prog: dict):
+    """Log structured user information banner upon login."""
+    log.info("=" * 60)
+    log.info("👤 USER ACCOUNT PROFILE")
+    log.info("=" * 60)
+    if user_info.get("name"):
+        log.info(f"• Name:               {user_info['name']}")
+    if user_info.get("email"):
+        log.info(f"• Email:              {user_info['email']}")
+    if user_info.get("dob"):
+        log.info(f"• Date of Birth:      {user_info['dob']}")
+    if user_info.get("reason"):
+        log.info(f"• Course Category:    {user_info['reason']}")
+    if user_info.get("address"):
+        log.info(f"• Address / Location: {user_info['address']}")
+    if user_info.get("enrollment_id"):
+        log.info(f"• Enrollment ID:      {user_info['enrollment_id']}")
+    if prog:
+        pct = f"({prog.get('percent', 0)}% Complete)" if 'percent' in prog else ""
+        log.info(f"• Progress Summary:   {prog.get('done', 0)}h / {prog.get('total', 75)}h total {pct}")
+    log.info("=" * 60)
+    log_event("user_profile_loaded", **user_info)
+
+
 async def wait_for_daily_reset(page, rs: RunState):
     """
     Called when daily limit (8.0h) is reached.
@@ -991,6 +1091,12 @@ async def main():
             await browser.close()
             sys.exit(1)
 
+        prog = await get_progress(page)
+        log_event("progress_snapshot", **prog)
+
+        user_info = await get_user_profile(page)
+        log_user_profile(user_info, prog)
+
         daily = await get_daily_status(page)
         hours_today = daily["hours_today"]
         hours_remaining_today = daily["hours_remaining_today"]
@@ -998,13 +1104,6 @@ async def main():
             f"📅 Today: {hours_today:.1f}h done, {hours_remaining_today:.1f}h left "
             f"(source: {daily['source']})"
         )
-
-        prog = await get_progress(page)
-        log.info(
-            f"📊 Overall: {prog['done']}h / {prog['total']}h  "
-            f"({prog['remaining']:.1f}h remaining)"
-        )
-        log_event("progress_snapshot", **prog)
 
         rs = RUN_STATE
         rs.hours_done = prog["done"]
