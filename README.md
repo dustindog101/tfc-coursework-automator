@@ -1,74 +1,135 @@
-# Foundation of Change Coursework Automator
+# TFC Coursework Automator
 
-Playwright bot that completes coursework on [The Foundation of Change](https://www.thefoundationofchange.org) platform. It discovers incomplete lessons from your coursework page, waits out reading/reflection timers, generates reflections via the `agy` CLI, and tracks daily hour limits.
+Automates community service coursework on [The Foundation of Change](https://www.thefoundationofchange.org). Discovers incomplete lessons, waits out timers, writes AI reflections, and stops at your daily hour limit.
 
-## Features
+---
 
-- **Catalog discovery** — scrapes `/coursework` for Done / Continue / Start status and skips completed articles
-- **State verification** — checks whether each lesson needs reading, reflection, or is already finished
-- **Dual timers** — handles both reading-page and reflection-page countdown timers
-- **Anti-logout scroll** — scrolls the page every ~3 minutes during any timer wait (reading *and* reflect)
-- **AI reflections** — uses `agy -p` to generate short, natural-sounding reflections while timers run
-- **Daily limit** — stops at 8 hours/day (tracked via local `events.jsonl`)
-- **Live status** — updates terminal line and macOS window title with article name, progress, and timer
-- **Auto-recovery** — designed to run in a bash restart loop for network blips
-
-## Prerequisites
-
-- Python 3.10+
-- [Playwright](https://playwright.dev/python/) Chromium browser
-- [`agy` CLI](https://github.com/) (optional — falls back to canned reflections if unavailable)
+## Quick start (3 commands)
 
 ```bash
-pip install -r requirements.txt
-playwright install chromium
+git clone https://github.com/dustindog101/tfc-coursework-automator.git
+cd tfc-coursework-automator
+./setup.sh
 ```
 
-## Setup
+Edit `.env` with your email and password, then:
 
-1. Clone this repo
-2. Copy `.env.example` → `.env`
-3. Add your Foundation of Change login credentials
+```bash
+./run.sh
+```
+
+That's it. A Chrome window opens and the bot runs until today's hours are done.
+
+---
+
+## How to run in Terminal
+
+Open **Terminal** and paste these one at a time:
+
+```bash
+cd ~/community-service
+./run.sh
+```
+
+| What you want | Command |
+|---------------|---------|
+| **Normal run** (browser visible) | `./run.sh` |
+| **First-time setup** | `./setup.sh` |
+| **Stop the bot** | `Ctrl + C` |
+| **Watch live logs** | `tail -f automation.log` |
+
+### Headless (no browser window)
+
+```bash
+HEADED=0 ./run.sh
+```
+
+---
+
+## What it does
+
+```
+Login → scrape /coursework → skip Done articles
+      → read article (wait timer) → write reflection (wait timer) → submit
+      → repeat until daily 8h limit → stop cleanly
+```
+
+| Feature | Detail |
+|---------|--------|
+| **Smart catalog** | Reads Done / Continue / Start from the coursework page |
+| **Daily limit** | Checks the site's "hours remaining today" before each lesson |
+| **Anti-logout** | Scrolls every ~3 min during reading *and* reflect timers |
+| **AI reflections** | Uses `agy` CLI (falls back to canned text if unavailable) |
+| **Resilience** | Auto-restarts on crash; re-logins on session expiry; re-scrapes catalog after each lesson |
+| **Live status** | Terminal line + window title show article name, timer, progress |
+
+---
+
+## Setup details
+
+### Requirements
+
+- Python 3.10+
+- Chromium via Playwright
+- `agy` CLI (optional, for AI reflections)
+
+### Credentials
 
 ```bash
 cp .env.example .env
-# edit .env with your email and password
 ```
 
-## Usage
+```env
+TFC_EMAIL=your-email@example.com
+TFC_PASSWORD=your-password
+```
 
-**Headed mode** (visible browser) with auto-restart loop:
+Never commit `.env` — it's gitignored.
+
+### macOS Playwright note
+
+If you see "Executable doesn't exist", set:
 
 ```bash
-export PLAYWRIGHT_BROWSERS_PATH="$HOME/Library/Caches/ms-playwright"  # macOS
-while true; do
-  HEADED=1 python3 run_courses.py
-  if [ $? -eq 0 ]; then echo "Finished cleanly."; break; fi
-  echo "Crashed, restarting in 5s..."
-  sleep 5
-done
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/Library/Caches/ms-playwright"
 ```
 
-**Headless mode** — omit `HEADED=1`.
+`run.sh` sets this automatically.
+
+---
 
 ## Environment variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `TFC_EMAIL` | Yes | Login email |
-| `TFC_PASSWORD` | Yes | Login password |
-| `TFC_BASE_URL` | No | Platform URL (default: foundationofchange.org) |
-| `TFC_LOG_FILE` | No | Text log path (default: `./automation.log`) |
-| `TFC_EVENTS_FILE` | No | JSONL events path (default: `./events.jsonl`) |
-| `HEADED` | No | Set to `1` for visible browser |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TFC_EMAIL` | — | Login email (required) |
+| `TFC_PASSWORD` | — | Login password (required) |
+| `TFC_DAILY_HOUR_LIMIT` | `8.0` | Max hours per day |
+| `TFC_MIN_HOURS_LEFT` | `0.35` | Won't start a lesson if less time left |
+| `HEADED` | `1` in run.sh | `1` = visible browser, `0` = headless |
+
+---
 
 ## Logs
 
 ```bash
-tail -f automation.log
-jq 'select(.event=="lesson_complete")' events.jsonl
+tail -f automation.log                              # text log
+jq 'select(.event=="lesson_complete")' events.jsonl   # completed lessons
 ```
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `Missing .env` | `cp .env.example .env` and add credentials |
+| Playwright browser missing | Run `./setup.sh` again |
+| Bot keeps restarting | Check `automation.log` for errors |
+| Wrong article / stuck | Stop with Ctrl+C, run `./run.sh` again — it re-reads the catalog |
+
+---
 
 ## Disclaimer
 
-This tool is for educational purposes. Use responsibly and in accordance with the platform's terms of service.
+Educational tool. Use responsibly and in accordance with the platform's terms of service.

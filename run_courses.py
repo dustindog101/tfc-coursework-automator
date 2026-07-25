@@ -62,7 +62,8 @@ SCROLL_INTERVAL_S = 165   # ~2.75 min
 POLL_INTERVAL_S   = 25    # timer poll frequency
 REFLECTION_MIN    = 80
 REFLECTION_MAX    = 295
-DAILY_HOUR_LIMIT  = 8.0   # TFC max hours per day
+DAILY_HOUR_LIMIT  = float(os.getenv("TFC_DAILY_HOUR_LIMIT", "8.0"))
+MIN_HOURS_LEFT    = float(os.getenv("TFC_MIN_HOURS_LEFT", "0.35"))  # don't start if less left today
 
 # ── Logging (text) ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -105,11 +106,56 @@ def get_today_hours_from_log() -> float:
                     rec = json.loads(line)
                     if rec.get("date") == today and rec.get("event") == "lesson_complete":
                         total += rec.get("hours_gained", 0.0)
-                except:
+                except Exception:
                     pass
     except FileNotFoundError:
         pass
     return total
+
+
+def parse_daily_remaining(body: str) -> Optional[float]:
+    """Parse '3.9h remaining today (8h max)' from coursework/dashboard."""
+    for pat in [
+        r"([\d.]+)\s*h\s*\n\s*remaining today",
+        r"remaining today[^\d]*([\d.]+)\s*h",
+        r"TODAY'S LIMIT\s*\n\s*([\d.]+)\s*h\s*\n\s*remaining",
+    ]:
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+async def get_daily_status(page) -> dict:
+    """Read today's hours from the site (source of truth) with log fallback."""
+    hours_from_log = get_today_hours_from_log()
+    remaining_today = None
+    try:
+        await page.goto(f"{BASE_URL}/coursework", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        if "login" in page.url:
+            await do_login(page)
+            await page.goto(f"{BASE_URL}/coursework", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+        body = await page.inner_text("body")
+        remaining_today = parse_daily_remaining(body)
+    except Exception as e:
+        log.warning(f"Could not read daily limit from site: {e}")
+
+    if remaining_today is not None:
+        hours_today = max(0.0, DAILY_HOUR_LIMIT - remaining_today)
+        return {
+            "hours_today": hours_today,
+            "hours_remaining_today": remaining_today,
+            "source": "site",
+        }
+
+    remaining = max(0.0, DAILY_HOUR_LIMIT - hours_from_log)
+    return {
+        "hours_today": hours_from_log,
+        "hours_remaining_today": remaining,
+        "source": "log",
+    }
 
 
 # ── Run state + live status display ───────────────────────────────────────────
@@ -757,15 +803,28 @@ async def reflect_phase(
 
 
 # ── Daily limit check ─────────────────────────────────────────────────────────
-def check_daily_limit(hours_today: float) -> bool:
-    """Returns True if we've hit the daily 8h limit."""
-    if hours_today >= DAILY_HOUR_LIMIT:
+def check_daily_limit(hours_today: float, hours_remaining: Optional[float] = None) -> bool:
+    """Returns True if we've hit the daily limit or can't fit another lesson."""
+    remaining = hours_remaining if hours_remaining is not None else max(0, DAILY_HOUR_LIMIT - hours_today)
+
+    if hours_today >= DAILY_HOUR_LIMIT or remaining <= 0:
         log.warning(
             f"⛔ Daily limit reached: {hours_today:.1f}h / {DAILY_HOUR_LIMIT}h. "
             f"Stopping for today."
         )
-        log_event("daily_limit_hit", hours_today=hours_today, limit=DAILY_HOUR_LIMIT)
+        log_event("daily_limit_hit", hours_today=hours_today, limit=DAILY_HOUR_LIMIT,
+                  hours_remaining=remaining)
         return True
+
+    if remaining < MIN_HOURS_LEFT:
+        log.warning(
+            f"⛔ Only {remaining:.1f}h left today (need ~{MIN_HOURS_LEFT}h per lesson). "
+            f"Stopping — resume tomorrow."
+        )
+        log_event("daily_limit_near", hours_today=hours_today, hours_remaining=remaining,
+                  min_needed=MIN_HOURS_LEFT)
+        return True
+
     return False
 
 
@@ -825,9 +884,6 @@ async def main():
     hours_today_start = get_today_hours_from_log()
     log.info(f"📅 Hours logged today (from events.jsonl): {hours_today_start:.1f}h")
 
-    if check_daily_limit(hours_today_start):
-        return
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=not bool(os.getenv("HEADED")),
@@ -845,6 +901,18 @@ async def main():
         if not await ensure_auth(page):
             log.error("Auth failed. Exiting.")
             await browser.close()
+            sys.exit(1)
+
+        daily = await get_daily_status(page)
+        hours_today = daily["hours_today"]
+        hours_remaining_today = daily["hours_remaining_today"]
+        log.info(
+            f"📅 Today: {hours_today:.1f}h done, {hours_remaining_today:.1f}h left "
+            f"(source: {daily['source']})"
+        )
+
+        if check_daily_limit(hours_today, hours_remaining_today):
+            await browser.close()
             return
 
         prog = await get_progress(page)
@@ -859,23 +927,36 @@ async def main():
             await browser.close()
             return
 
-        hours_today = hours_today_start
+        hours_today = daily["hours_today"]
         session_done = 0
         processed_urls: set[str] = set()
+        consecutive_errors = 0
         rs = RUN_STATE
         rs.hours_done = prog["done"]
         rs.hours_total = prog["total"]
         rs.hours_today = hours_today
 
-        while session_done < 60:
-            if check_daily_limit(hours_today):
+        while True:
+            daily = await get_daily_status(page)
+            hours_today = daily["hours_today"]
+            hours_remaining_today = daily["hours_remaining_today"]
+            rs.hours_today = hours_today
+
+            if check_daily_limit(hours_today, hours_remaining_today):
                 break
 
             lessons, cta_url = await fetch_coursework_catalog(page)
             if not lessons:
-                log.error("Empty catalog — retrying in 10s")
+                consecutive_errors += 1
+                log.error(f"Empty catalog — retry {consecutive_errors}/5 in 10s")
+                if consecutive_errors >= 5:
+                    log.error("Catalog failed 5 times — exiting for restart")
+                    await browser.close()
+                    sys.exit(1)
                 await page.wait_for_timeout(10000)
                 continue
+
+            consecutive_errors = 0
 
             rs.catalog_done = sum(1 for l in lessons if l.status == "done")
             queue = build_work_queue(lessons, cta_url, processed_urls)
@@ -904,10 +985,15 @@ async def main():
 
             try:
                 success, hours_gained = await process_lesson(page, lesson, hours_today, rs)
+                consecutive_errors = 0
             except Exception as e:
+                consecutive_errors += 1
                 log.error(f"Lesson error ({lesson.title!r}): {e}")
                 log_event("lesson_error", lesson_title=lesson.title, url=lesson.url, error=str(e))
-                processed_urls.add(lesson.url)
+                if consecutive_errors >= 3:
+                    log.error("3 lesson errors in a row — exiting for restart")
+                    await browser.close()
+                    sys.exit(1)
                 await page.wait_for_timeout(5000)
                 continue
 
