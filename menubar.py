@@ -46,6 +46,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.current_lesson = "None"
         self.upcoming_reflection = "No reflection generated yet."
         self.daily_limit_reached = False
+        self.last_state_id = "INIT"
         
         # User settings
         self.headed_mode = False        # Headless by default
@@ -53,10 +54,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.user_paused = False       # Tracks if user manually paused bot
         self.last_crash_time = 0.0
 
-        # ── 1. Status & Mode Header ──────────────────────────────────────────
-        self.item_mode = rumps.MenuItem("⚙️ Mode: Headless (Background Browser)", callback=None)
-        self.item_status = rumps.MenuItem("📌 Status: Idle", callback=None)
-        self.item_retry = rumps.MenuItem("⏰ Reset Policy: 12:00 AM local midnight with 2m retry", callback=None)
+        # ── 1. Status ──────────────────────────────────────────
+        self.item_status = rumps.MenuItem("⚙️ Initializing...", callback=None)
         
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
@@ -66,10 +65,10 @@ class TFCCourseworkMenuApp(rumps.App):
         
         # ── 3. Active Countdown Timers ───────────────────────────────────────
         self.menu_timers = rumps.MenuItem("⏱️ Active Timers")
-        self.item_read_timer = rumps.MenuItem("• Article Reading Timer: N/A")
-        self.item_submit_timer = rumps.MenuItem("• Reflection Submit Lock: N/A")
-        self.item_limit_timer = rumps.MenuItem("• Daily Midnight Reset: N/A")
-        self.item_scroll_timer = rumps.MenuItem("• Keep-Alive Micro-Scroll: Active (every 2.75m)")
+        self.item_read_timer = rumps.MenuItem("• Reading Timer: N/A")
+        self.item_submit_timer = rumps.MenuItem("• Reflection Submit-Lock Timer: N/A")
+        self.item_limit_timer = rumps.MenuItem("• Midnight Reset Timer: N/A (12:00 AM Local Time)")
+        self.item_scroll_timer = rumps.MenuItem("• Keep-Alive Scroll Timer: Active (every 2.75m)")
         self.menu_timers.update([
             self.item_read_timer, self.item_submit_timer,
             self.item_limit_timer, self.item_scroll_timer
@@ -78,35 +77,35 @@ class TFCCourseworkMenuApp(rumps.App):
         # ── 4. Upcoming AI Reflection Draft ──────────────────────────────────
         self.menu_reflection = rumps.MenuItem("📝 Upcoming AI Reflection")
         self.item_refl_preview = rumps.MenuItem("Draft: None ready")
-        self.item_refl_copy = rumps.MenuItem("📋 Copy Reflection to Clipboard", callback=self.copy_reflection)
+        self.item_refl_copy = rumps.MenuItem("📋 Copy Reflection", callback=self.copy_reflection)
         self.menu_reflection.update([self.item_refl_preview, self.item_refl_copy])
         
         # ── 5. User Profile & Account Audit ──────────────────────────────────
-        self.menu_profile = rumps.MenuItem("👤 Account Profile & Audit")
-        self.item_prof_name = rumps.MenuItem("• Name: Checking...")
+        self.menu_profile = rumps.MenuItem("👤 User Profile & Audit")
+        self.item_prof_name = rumps.MenuItem("• Full Name: Checking...")
         self.item_prof_email = rumps.MenuItem("• Email: Checking...")
-        self.item_prof_cat = rumps.MenuItem("• Category: Checking...")
-        self.item_prof_addr = rumps.MenuItem("• Address: Checking...")
+        self.item_prof_dob = rumps.MenuItem("• DOB: Checking...")
+        self.item_prof_cat = rumps.MenuItem("• Offense Category: Checking...")
+        self.item_prof_addr = rumps.MenuItem("• Location/Address: Checking...")
         self.item_prof_id = rumps.MenuItem("• Enrollment ID: Checking...")
-        self.item_prof_today = rumps.MenuItem("• Today's Hours: 0.0h / 8.0h")
-        self.item_prof_progress = rumps.MenuItem("• Overall Progress: 18.8h / 75.0h (25%)")
-        self.item_prof_remaining = rumps.MenuItem("• Hours Remaining: 56.2h")
+        self.item_prof_progress = rumps.MenuItem("• Progress: 18.8h / 75.0h (25%)")
+        self.item_prof_remaining = rumps.MenuItem("• Remaining Hours: 56.2h")
         self.menu_profile.update([
-            self.item_prof_name, self.item_prof_email, self.item_prof_cat,
-            self.item_prof_addr, self.item_prof_id, None,
-            self.item_prof_today, self.item_prof_progress, self.item_prof_remaining
+            self.item_prof_name, self.item_prof_email, self.item_prof_dob,
+            self.item_prof_cat, self.item_prof_addr, self.item_prof_id, None,
+            self.item_prof_progress, self.item_prof_remaining
         ])
         
         # ── 6. Live Event History ────────────────────────────────────────────
-        self.menu_history = rumps.MenuItem("📜 Live Event History")
+        self.menu_history = rumps.MenuItem("📜 Live History Stream")
         self.menu_history.add(rumps.MenuItem("No recent events"))
         
         # ── 7. Settings & Configuration Submenu ──────────────────────────────
         self.menu_settings = rumps.MenuItem("⚙️ Settings & Preferences")
-        self.item_set_headed = rumps.MenuItem("👁️ Browser Mode: Headless (Click to make Visible)", callback=self.toggle_headed)
-        self.item_set_autostart = rumps.MenuItem("🚀 Start on macOS Login [ OFF ]", callback=self.toggle_autostart)
-        self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart [ ✓ ON ]", callback=self.toggle_watchdog)
-        self.item_set_env = rumps.MenuItem("✏️ Edit Config & Credentials (.env)", callback=self.edit_env)
+        self.item_set_headed = rumps.MenuItem("👁️ Browser Mode Toggle: Headless", callback=self.toggle_headed)
+        self.item_set_autostart = rumps.MenuItem("🚀 macOS Start on Login: OFF", callback=self.toggle_autostart)
+        self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart Toggle: ON", callback=self.toggle_watchdog)
+        self.item_set_env = rumps.MenuItem("✏️ Edit Credentials (.env)", callback=self.edit_env)
         self.menu_settings.update([
             self.item_set_headed,
             self.item_set_autostart,
@@ -118,15 +117,12 @@ class TFCCourseworkMenuApp(rumps.App):
         # ── 8. Automator Controls ────────────────────────────────────────────
         self.item_bot_toggle = rumps.MenuItem("▶️ Start Automator Engine", callback=self.toggle_bot)
         self.item_open_dashboard = rumps.MenuItem("🌐 Open TFC Dashboard", callback=self.open_dashboard)
-        self.item_view_log = rumps.MenuItem("📋 Open Log File (automation.log)", callback=self.open_log)
-        self.item_open_folder = rumps.MenuItem("📂 Open Project Directory", callback=self.open_folder)
-        self.item_quit = rumps.MenuItem("❌ Quit Menu Bar App", callback=rumps.quit_application)
+        self.item_view_log = rumps.MenuItem("📋 Open Log File", callback=self.open_log)
+        self.item_quit = rumps.MenuItem("❌ Quit", callback=rumps.quit_application)
         
         # Assemble Menu Layout
         self.menu = [
-            self.item_mode,
             self.item_status,
-            self.item_retry,
             None,
             self.menu_queue,
             self.menu_timers,
@@ -138,7 +134,6 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_bot_toggle,
             self.item_open_dashboard,
             self.item_view_log,
-            self.item_open_folder,
             None,
             self.item_quit
         ]
@@ -177,7 +172,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 self.start_bot_process()
                 rumps.notification(
                     "TFC Automator",
-                    "Automator Engine Started (Headless) 🚀",
+                    "Automator Engine Started",
                     "Coursework bot is running in background Headless mode."
                 )
             except Exception as e:
@@ -189,11 +184,8 @@ class TFCCourseworkMenuApp(rumps.App):
         bot_running = self.is_bot_running()
         if bot_running:
             self.item_bot_toggle.title = "⏸️ Pause Automator Engine"
-            mode_str = "Headed (Visible Browser)" if self.headed_mode else "Headless (Background Browser)"
-            self.item_mode.title = f"⚙️ Mode: {mode_str}"
         else:
             self.item_bot_toggle.title = "▶️ Start Automator Engine"
-            self.item_mode.title = "⚙️ Mode: Automator Engine Idle"
 
     def toggle_bot(self, _):
         """Start or pause the run_courses.py process."""
@@ -217,10 +209,10 @@ class TFCCourseworkMenuApp(rumps.App):
         """Toggle browser visibility mode (Headless vs Headed)."""
         self.headed_mode = not self.headed_mode
         if self.headed_mode:
-            self.item_set_headed.title = "👁️ Browser Mode: Headed (Visible Browser)"
+            self.item_set_headed.title = "👁️ Browser Mode Toggle: Headed"
             rumps.notification("TFC Settings", "Browser Mode: Headed", "Future bot runs will display a visible browser window.")
         else:
-            self.item_set_headed.title = "👁️ Browser Mode: Headless (Background Browser)"
+            self.item_set_headed.title = "👁️ Browser Mode Toggle: Headless"
             rumps.notification("TFC Settings", "Browser Mode: Headless", "Future bot runs will execute in background Headless mode.")
             
         # Restart bot process with new mode if active
@@ -240,9 +232,9 @@ class TFCCourseworkMenuApp(rumps.App):
     def sync_autostart_ui(self):
         """Update menu title for start on login setting."""
         if self.is_autostart_enabled():
-            self.item_set_autostart.title = "🚀 Start on macOS Login [ ✓ ON ]"
+            self.item_set_autostart.title = "🚀 macOS Start on Login: ON"
         else:
-            self.item_set_autostart.title = "🚀 Start on macOS Login [ OFF ]"
+            self.item_set_autostart.title = "🚀 macOS Start on Login: OFF"
 
     def toggle_autostart(self, _):
         """Enable or disable start on macOS login via LaunchAgent."""
@@ -284,10 +276,10 @@ class TFCCourseworkMenuApp(rumps.App):
         """Toggle lightweight watchdog auto-restart."""
         self.watchdog_enabled = not self.watchdog_enabled
         if self.watchdog_enabled:
-            self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart [ ✓ ON ]"
+            self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart Toggle: ON"
             rumps.notification("TFC Settings", "Watchdog Active 🛡️", "Lightweight watchdog will auto-restart runner on crash.")
         else:
-            self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart [ OFF ]"
+            self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart Toggle: OFF"
             rumps.notification("TFC Settings", "Watchdog Disabled", "Automatic crash restart disabled.")
 
     def edit_env(self, _):
@@ -318,10 +310,6 @@ class TFCCourseworkMenuApp(rumps.App):
         if os.path.exists(LOG_FILE):
             subprocess.run(["open", LOG_FILE])
 
-    def open_folder(self, _):
-        """Open project root directory in macOS Finder."""
-        subprocess.run(["open", ROOT_DIR])
-
     @rumps.timer(1)
     def update_state(self, _):
         """Polled every 1 second: monitors runner, watchdog, events.jsonl & automation.log."""
@@ -336,6 +324,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 print("🛡️ Watchdog: restarting automation engine in background...")
                 try:
                     self.start_bot_process()
+                    bot_active = True
                     rumps.notification("TFC Watchdog 🛡️", "Engine Restarted", "Watchdog automatically restarted coursework engine.")
                 except Exception as e:
                     print(f"Watchdog restart failed: {e}")
@@ -384,7 +373,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 event_name = ev.get("event", "event")
                 
                 if event_name == "user_profile_loaded":
-                    history_items.append(f"{t_prefix}👤 Account Profile Loaded")
+                    history_items.append(f"{t_prefix}👤 Profile Loaded")
                 elif event_name == "progress_snapshot":
                     history_items.append(f"{t_prefix}📊 Progress Snapshot ({ev.get('done')}h/{ev.get('total')}h)")
                 elif event_name == "lesson_start":
@@ -406,25 +395,27 @@ class TFCCourseworkMenuApp(rumps.App):
                     self.menu_history.add(rumps.MenuItem(h))
                     
         # 2. Update Profile & Progress UI
-        name = self.profile.get("FULL NAME") or self.profile.get("name") or "Amanuel Hailie"
-        email = self.profile.get("EMAIL (READ-ONLY)") or self.profile.get("email") or "tfc@cybershare.tech"
-        reason = self.profile.get("COMMUNITY SERVICE RELATED TO") or self.profile.get("reason") or "Drug Possession"
-        addr = self.profile.get("ADDRESS") or self.profile.get("address") or "217 spring ave, rockville"
-        eid = self.profile.get("ENROLLMENT PROOF ID") or self.profile.get("enrollment_id") or "e70e6763-..."
+        name = self.profile.get("FULL NAME") or self.profile.get("name") or "Unknown"
+        email = self.profile.get("EMAIL (READ-ONLY)") or self.profile.get("email") or "Unknown"
+        dob = self.profile.get("DATE OF BIRTH") or self.profile.get("dob") or "Unknown"
+        reason = self.profile.get("COMMUNITY SERVICE RELATED TO") or self.profile.get("reason") or "Unknown"
+        addr = self.profile.get("ADDRESS") or self.profile.get("address") or "Unknown"
+        eid = self.profile.get("ENROLLMENT PROOF ID") or self.profile.get("enrollment_id") or "Unknown"
         
-        self.item_prof_name.title = f"• Name: {name}"
+        self.item_prof_name.title = f"• Full Name: {name}"
         self.item_prof_email.title = f"• Email: {email}"
-        self.item_prof_cat.title = f"• Category: {reason}"
-        self.item_prof_addr.title = f"• Address: {addr[:30]}"
+        self.item_prof_dob.title = f"• DOB: {dob}"
+        self.item_prof_cat.title = f"• Offense Category: {reason}"
+        self.item_prof_addr.title = f"• Location/Address: {addr[:30]}"
         self.item_prof_id.title = f"• Enrollment ID: {eid[:18]}..."
         
-        done = self.progress.get("done", 18.8)
-        total = self.progress.get("total", 75.0)
-        rem = self.progress.get("remaining", 56.2)
+        done = self.progress.get("done", 0.0)
+        total = self.progress.get("total", 0.0)
+        rem = self.progress.get("remaining", 0.0)
         pct = int((done / total) * 100) if total else 0
         
-        self.item_prof_progress.title = f"• Overall Progress: {done}h / {total}h ({pct}% Complete)"
-        self.item_prof_remaining.title = f"• Hours Remaining: {rem:.1f}h"
+        self.item_prof_progress.title = f"• Progress: {done}h / {total}h ({pct}%)"
+        self.item_prof_remaining.title = f"• Remaining Hours: {rem:.1f}h"
         
         # 3. Update Reflection Draft UI
         if self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
@@ -475,48 +466,62 @@ class TFCCourseworkMenuApp(rumps.App):
         h_rem = diff_s // 3600
         m_rem = (diff_s % 3600) // 60
         s_rem = diff_s % 60
-        calc_reset_str = f"{h_rem:02d}h {m_rem:02d}m {s_rem:02d}s"
+        calc_reset_str = f"{h_rem:02d}h {m_rem:02d}m"
+        calc_reset_str_secs = f"{h_rem:02d}h {m_rem:02d}m {s_rem:02d}s"
+
+        new_state_id = ""
 
         # Update UI according to active state
         if is_limit_wait or is_retrying_after_midnight:
+            new_state_id = "LIMIT"
+            # Title format: 🌙 Reset in 07h 42m | 8.0/8h (Assume they meant done_today/8.0h or something, 
+            # but standard is done/total, let's use done/total for consistency if not we can use 8.0/8h)
             if is_retrying_after_midnight and diff_s == 0:
                 self.title = f"🔄 Reset Check (2m Retry) | {done}/{total}h"
-                self.item_status.title = "📌 Status: 🌙 Midnight Passed — Retrying Site Reset (2m loop)"
-                self.item_limit_timer.title = "• Daily Midnight Reset: Retrying every 2 minutes..."
+                self.item_status.title = "🌙 Limit Wait - Retrying Reset"
+                self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
-                self.title = f"🌙 Reset in {h_rem:02d}h {m_rem:02d}m | {done}/{total}h"
-                self.item_status.title = "📌 Status: 🌙 Daily Limit Reached (Auto-resuming at 12:00 AM local time)"
-                self.item_limit_timer.title = f"• Daily Midnight Reset: {calc_reset_str} (Target: 12:00 AM Local)"
+                self.title = f"🌙 Reset in {calc_reset_str} | 8.0/8h"
+                self.item_status.title = "🌙 Limit Wait"
+                self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
                 
-            self.item_prof_today.title = "• Today's Logged: 8.0h / 8.0h (Limit Reached)"
-            self.item_queue_today.title = "Logged Today: 8.0h / 8.0h (Daily Limit Reached)"
-            self.item_retry.title = "⏰ Reset Policy: Resumes at 12:00 AM local time (2m retry if delayed)"
-
+            self.item_queue_today.title = "Logged Today: 8.0h / 8.0h (Limit Reached)"
+            
         elif bot_active:
+            new_state_id = "ACTIVE"
             if read_timer_str != "N/A":
-                self.title = f"📖 {read_timer_str} | {done}/{total}h"
-                self.item_status.title = f"📌 Status: 📖 Reading Article for {self.current_lesson}"
+                self.title = f"🟢 {read_timer_str} | {done}/{total}h"
             elif submit_timer_str != "N/A":
-                self.title = f"✍️ Submit {submit_timer_str} | {done}/{total}h"
-                self.item_status.title = f"📌 Status: ✍️ Submitting Reflection for {self.current_lesson}"
+                self.title = f"🟢 Submit {submit_timer_str} | {done}/{total}h"
             else:
-                self.title = f"🎓 Bot Active | {done}/{total}h"
-                self.item_status.title = "📌 Status: 🤖 Automator Running & Monitoring Queue"
+                self.title = f"🟢 Active | {done}/{total}h"
                 
-            self.item_prof_today.title = "• Today's Logged: Active Coursework"
+            self.item_status.title = "🟢 Active"
             self.item_queue_today.title = f"Logged Today: Processing ({done}h total)"
-            self.item_retry.title = "⏰ Reset Policy: Active Coursework Mode"
-
+            
         else:
-            self.title = f"🎓 TFC Bot: Idle ({done}/{total}h)"
-            self.item_status.title = "📌 Status: ⏸️ Automator Paused / Idle"
-            self.item_prof_today.title = f"• Today's Logged: {done}h / 8.0h"
+            new_state_id = "IDLE"
+            self.title = f"⏸️ Idle | {done}/{total}h"
+            self.item_status.title = "⏸️ Paused"
             self.item_queue_today.title = f"Logged Today: Paused ({done}h total)"
-            self.item_retry.title = "⏰ Reset Policy: 12:00 AM local midnight with 2m retry"
 
         self.item_queue_lesson.title = f"Active Lesson: {self.current_lesson}"
-        self.item_read_timer.title = f"• Article Reading Timer: {read_timer_str}"
-        self.item_submit_timer.title = f"• Reflection Submit Lock: {submit_timer_str}"
+        self.item_read_timer.title = f"• Reading Timer: {read_timer_str}"
+        self.item_submit_timer.title = f"• Reflection Submit-Lock Timer: {submit_timer_str}"
+        
+        if not is_limit_wait and not is_retrying_after_midnight:
+             self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
+
+        # Notifications for state transitions
+        if self.last_state_id != "INIT" and new_state_id != self.last_state_id:
+            if new_state_id == "ACTIVE":
+                rumps.notification("TFC Automator", "Status: Active 🟢", "Bot has resumed active coursework.")
+            elif new_state_id == "LIMIT":
+                rumps.notification("TFC Automator", "Status: Limit Wait 🌙", "Daily limit reached. Waiting for reset.")
+            elif new_state_id == "IDLE":
+                rumps.notification("TFC Automator", "Status: Paused ⏸️", "Automator is now idle/paused.")
+        
+        self.last_state_id = new_state_id
 
 
 if __name__ == "__main__":
