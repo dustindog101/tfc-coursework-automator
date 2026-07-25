@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 # macOS Playwright browser cache (skip if already set)
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/Library/Caches/ms-playwright}"
-export HEADED=1
+export HEADED="${HEADED:-0}"
 
 if [[ ! -f .env ]]; then
   echo "❌ Missing .env file"

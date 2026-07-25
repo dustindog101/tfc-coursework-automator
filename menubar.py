@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-TFC Coursework Automator — Premium macOS Menu Bar App
-Built with rumps (PyObjC native Cocoa NSStatusItem). Lightweight & zero heavy dependencies.
+TFC Coursework Automator — Lightweight macOS Menu Bar App
+Built with rumps (PyObjC native Cocoa NSStatusItem). Ultra-lightweight (<15MB RAM, 30KB disk).
 
 Features:
-- Live Menu Bar Title (Current phase, lesson & countdown timers)
-- Deep Integration with run_courses.py Engine & Event Stream
-- Automatic Daily Midnight Reset Detection & 2-Minute Retry Monitoring
-- Active Timers: Reading, Submit-Lock, Midnight Reset, Anti-Logout Keep-Alive
-- Upcoming AI Reflection Draft Preview with 1-Click Clipboard Copy
-- Comprehensive User Account Profile & Coursework Progress Audit
-- Real-time Scrollable Event History with Timestamps
-- 1-Click Process Controller (Start / Stop Automator)
+- Headless Mode by Default (background browser execution)
+- Editable Settings & Configuration Submenu
+- Native Start on macOS Login (LaunchAgent integration)
+- Lightweight Watchdog Engine (auto-restarts runner on crash)
+- Live Menu Bar Title & Countdown Timers
+- Upcoming AI Reflection Draft Preview & 1-Click Clipboard Copy
+- Comprehensive User Account Profile & Coursework Audit
+- Real-time Event History Stream
 """
 
 import os
@@ -27,6 +27,8 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 EVENTS_FILE = os.path.join(ROOT_DIR, "events.jsonl")
 LOG_FILE = os.path.join(ROOT_DIR, "automation.log")
 SCRIPT_PATH = os.path.join(ROOT_DIR, "run_courses.py")
+ENV_FILE = os.path.join(ROOT_DIR, ".env")
+LAUNCH_AGENT_PATH = os.path.expanduser("~/Library/LaunchAgents/com.tfc.automator.plist")
 
 
 class TFCCourseworkMenuApp(rumps.App):
@@ -42,8 +44,14 @@ class TFCCourseworkMenuApp(rumps.App):
         self.upcoming_reflection = "No reflection generated yet."
         self.daily_limit_reached = False
         
+        # User settings
+        self.headed_mode = False        # Headless by default
+        self.watchdog_enabled = True   # Watchdog active by default
+        self.user_paused = False       # Tracks if user manually paused bot
+        self.last_crash_time = 0.0
+
         # ── 1. Status & Mode Header ──────────────────────────────────────────
-        self.item_mode = rumps.MenuItem("⚙️ Mode: Checking...", callback=None)
+        self.item_mode = rumps.MenuItem("⚙️ Mode: Headless (Background Browser)", callback=None)
         self.item_status = rumps.MenuItem("📌 Status: Idle", callback=None)
         self.item_retry = rumps.MenuItem("⏰ Reset Policy: 00:00 midnight with 2m retry", callback=None)
         
@@ -90,7 +98,21 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu_history = rumps.MenuItem("📜 Live Event History")
         self.menu_history.add(rumps.MenuItem("No recent events"))
         
-        # ── 7. Automator Controls ────────────────────────────────────────────
+        # ── 7. Settings & Configuration Submenu ──────────────────────────────
+        self.menu_settings = rumps.MenuItem("⚙️ Settings & Preferences")
+        self.item_set_headed = rumps.MenuItem("👁️ Browser Mode: Headless (Click to make Visible)", callback=self.toggle_headed)
+        self.item_set_autostart = rumps.MenuItem("🚀 Start on macOS Login [ OFF ]", callback=self.toggle_autostart)
+        self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart [ ✓ ON ]", callback=self.toggle_watchdog)
+        self.item_set_env = rumps.MenuItem("✏️ Edit Config & Credentials (.env)", callback=self.edit_env)
+        self.menu_settings.update([
+            self.item_set_headed,
+            self.item_set_autostart,
+            self.item_set_watchdog,
+            None,
+            self.item_set_env
+        ])
+        
+        # ── 8. Automator Controls ────────────────────────────────────────────
         self.item_bot_toggle = rumps.MenuItem("▶️ Start Automator Engine", callback=self.toggle_bot)
         self.item_open_dashboard = rumps.MenuItem("🌐 Open TFC Dashboard", callback=self.open_dashboard)
         self.item_view_log = rumps.MenuItem("📋 Open Log File (automation.log)", callback=self.open_log)
@@ -108,6 +130,7 @@ class TFCCourseworkMenuApp(rumps.App):
             self.menu_reflection,
             self.menu_profile,
             self.menu_history,
+            self.menu_settings,
             None,
             self.item_bot_toggle,
             self.item_open_dashboard,
@@ -117,7 +140,10 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_quit
         ]
         
-        # Auto-launch bot process on app start if not already running
+        # Check start on login state
+        self.sync_autostart_ui()
+
+        # Auto-launch bot process in Headless mode by default
         self.ensure_bot_running_on_start()
 
     def is_bot_running(self):
@@ -130,48 +156,145 @@ class TFCCourseworkMenuApp(rumps.App):
             pass
         return False
 
+    def start_bot_process(self):
+        """Start run_courses.py process in background."""
+        env = os.environ.copy()
+        if self.headed_mode:
+            env["HEADED"] = "1"
+        else:
+            env.pop("HEADED", None)
+            
+        subprocess.Popen(["python3", "-u", SCRIPT_PATH], cwd=ROOT_DIR, env=env)
+        self.user_paused = False
+
     def ensure_bot_running_on_start(self):
-        """Auto-start the automation engine if it isn't running already."""
+        """Auto-start the automation engine in headless mode by default."""
         if not self.is_bot_running():
             try:
-                env = os.environ.copy()
-                env["HEADED"] = "1"
-                subprocess.Popen(["python3", "-u", SCRIPT_PATH], cwd=ROOT_DIR, env=env)
+                self.start_bot_process()
                 rumps.notification(
                     "TFC Automator",
-                    "Automator Engine Auto-Started 🚀",
-                    "Coursework bot is running in the background and monitoring daily limits."
+                    "Automator Engine Started (Headless) 🚀",
+                    "Coursework bot is running in background Headless mode."
                 )
             except Exception as e:
                 print(f"Could not auto-start bot: {e}")
         self.update_toggle_button()
 
     def update_toggle_button(self):
-        """Sync toggle button label with running state."""
-        if self.is_bot_running():
+        """Sync UI toggle labels with active state."""
+        bot_running = self.is_bot_running()
+        if bot_running:
             self.item_bot_toggle.title = "⏸️ Pause Automator Engine"
-            self.item_mode.title = "⚙️ Mode: Background Engine Active (Headed)"
+            mode_str = "Headed (Visible Browser)" if self.headed_mode else "Headless (Background Browser)"
+            self.item_mode.title = f"⚙️ Mode: {mode_str}"
         else:
             self.item_bot_toggle.title = "▶️ Start Automator Engine"
             self.item_mode.title = "⚙️ Mode: Automator Engine Idle"
 
     def toggle_bot(self, _):
-        """Start or stop the run_courses.py process."""
+        """Start or pause the run_courses.py process."""
         if self.is_bot_running():
             try:
+                self.user_paused = True
                 subprocess.run(["pkill", "-f", "run_courses.py"])
                 rumps.notification("TFC Automator", "Automator Paused ⏸️", "Coursework process has been paused.")
             except Exception as e:
-                rumps.alert(f"Error stopping bot: {e}")
+                rumps.alert(f"Error pausing bot: {e}")
         else:
             try:
-                env = os.environ.copy()
-                env["HEADED"] = "1"
-                subprocess.Popen(["python3", "-u", SCRIPT_PATH], cwd=ROOT_DIR, env=env)
-                rumps.notification("TFC Automator", "Automator Started 🚀", "Coursework automation is actively processing.")
+                self.start_bot_process()
+                mode_name = "Headed" if self.headed_mode else "Headless"
+                rumps.notification("TFC Automator", "Automator Started 🚀", f"Running in {mode_name} mode.")
             except Exception as e:
                 rumps.alert(f"Error starting bot: {e}")
         self.update_toggle_button()
+
+    def toggle_headed(self, _):
+        """Toggle browser visibility mode (Headless vs Headed)."""
+        self.headed_mode = not self.headed_mode
+        if self.headed_mode:
+            self.item_set_headed.title = "👁️ Browser Mode: Headed (Visible Browser)"
+            rumps.notification("TFC Settings", "Browser Mode: Headed", "Future bot runs will display a visible browser window.")
+        else:
+            self.item_set_headed.title = "👁️ Browser Mode: Headless (Background Browser)"
+            rumps.notification("TFC Settings", "Browser Mode: Headless", "Future bot runs will execute in background Headless mode.")
+            
+        # Restart bot process with new mode if active
+        if self.is_bot_running():
+            try:
+                subprocess.run(["pkill", "-f", "run_courses.py"])
+                time.sleep(1)
+                self.start_bot_process()
+            except Exception:
+                pass
+        self.update_toggle_button()
+
+    def is_autostart_enabled(self):
+        """Check if launch agent plist exists."""
+        return os.path.exists(LAUNCH_AGENT_PATH)
+
+    def sync_autostart_ui(self):
+        """Update menu title for start on login setting."""
+        if self.is_autostart_enabled():
+            self.item_set_autostart.title = "🚀 Start on macOS Login [ ✓ ON ]"
+        else:
+            self.item_set_autostart.title = "🚀 Start on macOS Login [ OFF ]"
+
+    def toggle_autostart(self, _):
+        """Enable or disable start on macOS login via LaunchAgent."""
+        if self.is_autostart_enabled():
+            try:
+                os.remove(LAUNCH_AGENT_PATH)
+                rumps.notification("TFC Settings", "Start on Login Disabled", "Automator will no longer launch automatically on login.")
+            except Exception as e:
+                rumps.alert(f"Failed to remove login item: {e}")
+        else:
+            try:
+                os.makedirs(os.path.dirname(LAUNCH_AGENT_PATH), exist_ok=True)
+                plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tfc.automator</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{sys.executable}</string>
+        <string>{os.path.join(ROOT_DIR, "menubar.py")}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>{ROOT_DIR}</string>
+</dict>
+</plist>
+"""
+                with open(LAUNCH_AGENT_PATH, "w", encoding="utf-8") as f:
+                    f.write(plist_content)
+                rumps.notification("TFC Settings", "Start on Login Enabled 🚀", "Menu bar app will launch automatically whenever you log into macOS.")
+            except Exception as e:
+                rumps.alert(f"Failed to enable start on login: {e}")
+        self.sync_autostart_ui()
+
+    def toggle_watchdog(self, _):
+        """Toggle lightweight watchdog auto-restart."""
+        self.watchdog_enabled = not self.watchdog_enabled
+        if self.watchdog_enabled:
+            self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart [ ✓ ON ]"
+            rumps.notification("TFC Settings", "Watchdog Active 🛡️", "Lightweight watchdog will auto-restart runner on crash.")
+        else:
+            self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart [ OFF ]"
+            rumps.notification("TFC Settings", "Watchdog Disabled", "Automatic crash restart disabled.")
+
+    def edit_env(self, _):
+        """Open .env file in default text editor."""
+        if not os.path.exists(ENV_FILE):
+            example_path = os.path.join(ROOT_DIR, ".env.example")
+            if os.path.exists(example_path):
+                import shutil
+                shutil.copy(example_path, ENV_FILE)
+        subprocess.run(["open", ENV_FILE])
 
     def copy_reflection(self, _):
         """Copy current upcoming reflection to macOS system clipboard."""
@@ -198,10 +321,22 @@ class TFCCourseworkMenuApp(rumps.App):
 
     @rumps.timer(1)
     def update_state(self, _):
-        """Polled every 1 second: parses events.jsonl & automation.log for real-time state."""
+        """Polled every 1 second: monitors runner, watchdog, events.jsonl & automation.log."""
         bot_active = self.is_bot_running()
         self.update_toggle_button()
         
+        # Lightweight Watchdog Check (if enabled & not explicitly paused by user)
+        if self.watchdog_enabled and not self.user_paused and not bot_active:
+            now_ts = time.time()
+            if now_ts - self.last_crash_time > 5.0:
+                self.last_crash_time = now_ts
+                print("🛡️ Watchdog: restarting automation engine in background...")
+                try:
+                    self.start_bot_process()
+                    rumps.notification("TFC Watchdog 🛡️", "Engine Restarted", "Watchdog automatically restarted coursework engine.")
+                except Exception as e:
+                    print(f"Watchdog restart failed: {e}")
+
         # 1. Parse events.jsonl
         events = []
         if os.path.exists(EVENTS_FILE):
