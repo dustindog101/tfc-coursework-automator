@@ -137,18 +137,14 @@ async def get_daily_status(page) -> dict:
     remaining_today = None
     site_limit_reached = False
     try:
-        await page.goto(f"{BASE_URL}/coursework", wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        if "login" in page.url:
-            await do_login(page)
-            await page.goto(f"{BASE_URL}/coursework", wait_until="domcontentloaded")
+        if await safe_goto(page, f"{BASE_URL}/coursework"):
             await page.wait_for_timeout(2000)
-        body = await page.inner_text("body")
-        if re.search(r"daily limit reached", body, re.IGNORECASE):
-            site_limit_reached = True
-            remaining_today = 0.0
-        else:
-            remaining_today = parse_daily_remaining(body)
+            body = await page.inner_text("body")
+            if re.search(r"daily limit reached", body, re.IGNORECASE):
+                site_limit_reached = True
+                remaining_today = 0.0
+            else:
+                remaining_today = parse_daily_remaining(body)
     except Exception as e:
         log.warning(f"Could not read daily limit from site: {e}")
 
@@ -361,16 +357,19 @@ def parse_timer(body: str) -> int:
 
 async def get_timer(page) -> int:
     try:
-        return parse_timer(await page.inner_text("body"))
+        body = await page.inner_text("body")
+        if "ERR_" in body or "No internet" in body or "net::" in body:
+            return -1
+        return parse_timer(body)
     except:
-        return 0
+        return -1
 
 
 async def get_progress(page) -> dict:
     try:
-        await page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-        body = await page.inner_text("body")
+        if await safe_goto(page, f"{BASE_URL}/dashboard"):
+            await page.wait_for_timeout(2000)
+            body = await page.inner_text("body")
         m = re.search(r'(\d+\.?\d*)\s*/\s*(\d+)\s*hours', body)
         if m:
             done  = float(m.group(1))
@@ -655,6 +654,11 @@ async def wait_for_timer(
             log.info(f"[{phase}] ✓ timer expired — {lesson_title!r}")
             sys.stderr.write("\n")
             break
+        elif secs == -1:
+            log.warning(f"[{phase}] network error reading timer, retrying...")
+            await page.wait_for_timeout(POLL_INTERVAL_S * 1000)
+            elapsed += POLL_INTERVAL_S
+            continue
 
         live_status(phase, secs, lesson_title, hours_done, hours_today, hours_total, rs)
 
@@ -967,6 +971,7 @@ async def wait_for_daily_reset(page, rs: RunState):
     start_time = time.time()
     last_check_time = time.time()
     last_notify_time = 0.0
+    last_scroll_time = time.time()
 
     while True:
         now = datetime.now()
@@ -987,7 +992,7 @@ async def wait_for_daily_reset(page, rs: RunState):
             last_check_time = time.time()
             log.info("🔍 Periodic check: inspecting daily limit status on site...")
             daily = await get_daily_status(page)
-            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached"):
+            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
                 log.info(f"🌅 Site daily limit reset detected! ({daily['hours_remaining_today']:.1f}h remaining today)")
                 break
 
@@ -995,20 +1000,21 @@ async def wait_for_daily_reset(page, rs: RunState):
             log.info("🌅 Local midnight reached! Checking daily limit status on site...")
             await page.wait_for_timeout(5000)
             daily = await get_daily_status(page)
-            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached"):
+            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
                 log.info("🌅 Daily limit reset confirmed! Resuming coursework...")
                 break
             else:
                 log.info("⏳ Midnight reached! Reset not updated on site yet; retrying in 2 minutes...")
                 await page.wait_for_timeout(120000)
 
-        try:
-            if int(time.time()) % 120 == 0:
+        if time.time() - last_scroll_time >= 120:
+            last_scroll_time = time.time()
+            try:
                 await page.evaluate("window.scrollBy(0, 100)")
                 await page.wait_for_timeout(300)
                 await page.evaluate("window.scrollBy(0, -100)")
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         await page.wait_for_timeout(25000)
 
@@ -1135,9 +1141,9 @@ async def main():
                 consecutive_errors += 1
                 log.error(f"Empty catalog — retry {consecutive_errors}/5 in 10s")
                 if consecutive_errors >= 5:
-                    log.error("Catalog failed 5 times — exiting for restart")
-                    await browser.close()
-                    sys.exit(1)
+                    log.error("Catalog failed 5 times — waiting 60s before retry...")
+                    await page.wait_for_timeout(60000)
+                    continue
                 await page.wait_for_timeout(10000)
                 continue
 
@@ -1176,9 +1182,9 @@ async def main():
                 log.error(f"Lesson error ({lesson.title!r}): {e}")
                 log_event("lesson_error", lesson_title=lesson.title, url=lesson.url, error=str(e))
                 if consecutive_errors >= 3:
-                    log.error("3 lesson errors in a row — exiting for restart")
-                    await browser.close()
-                    sys.exit(1)
+                    log.error("3 lesson errors in a row — waiting 60s before retry...")
+                    await page.wait_for_timeout(60000)
+                    continue
                 await page.wait_for_timeout(5000)
                 continue
 
