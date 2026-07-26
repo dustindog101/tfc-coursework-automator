@@ -66,7 +66,7 @@ class TFCCourseworkMenuApp(rumps.App):
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
         self.item_queue_lesson = rumps.MenuItem("📌 Active Lesson: None")
-        self.item_queue_today = rumps.MenuItem("📅 Logged Today:  [░░░░░░░░░░░░░░░░░░░░] 0% (0.0 / 8.0h)")
+        self.item_queue_today = rumps.MenuItem("📅 Logged Today:  [░░░░░░░░░░] 0% (0.0 / 8.0h)")
         self.menu_queue.update([self.item_queue_lesson, self.item_queue_today])
         
         # ── 3. Active Countdown Timers ───────────────────────────────────────
@@ -94,7 +94,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_prof_cat = rumps.MenuItem("• Offense Category: Checking...")
         self.item_prof_addr = rumps.MenuItem("• Location/Address: Checking...")
         self.item_prof_id = rumps.MenuItem("• Enrollment ID: Checking...")
-        self.item_prof_progress = rumps.MenuItem("📊 Total Progress: [█████░░░░░░░░░░░░░░░] 25% (18.8 / 75.0h)")
+        self.item_prof_progress = rumps.MenuItem("📊 Total Progress: [███░░░░░░░] 25% (18.8 / 75.0h)")
         self.item_prof_remaining = rumps.MenuItem("• Remaining Hours: 56.2h")
         self.menu_profile.update([
             self.item_prof_name, self.item_prof_email, self.item_prof_dob,
@@ -437,9 +437,9 @@ class TFCCourseworkMenuApp(rumps.App):
         rem = self.progress.get("remaining", 0.0)
         pct = int((done / total) * 100) if total else 0
         
-        filled = int(round((pct / 100) * 20)) if total else 0
-        filled = max(0, min(20, filled))
-        bar = "█" * filled + "░" * (20 - filled)
+        filled = int(round((pct / 100) * 10)) if total else 0
+        filled = max(0, min(10, filled))
+        bar = "█" * filled + "░" * (10 - filled)
         
         self.item_prof_progress.title = f"📊 Total Progress: [{bar}] {pct}% ({done} / {total}h)"
         self.item_prof_remaining.title = f"• Remaining Hours: {rem:.1f}h"
@@ -504,9 +504,9 @@ class TFCCourseworkMenuApp(rumps.App):
             hrs_today_f = 0.0
 
         daily_pct = int(min(100, max(0, (hrs_today_f / 8.0) * 100)))
-        daily_filled = int(round((daily_pct / 100.0) * 20))
-        daily_filled = max(0, min(20, daily_filled))
-        daily_bar = "█" * daily_filled + "░" * (20 - daily_filled)
+        daily_filled = int(round((daily_pct / 100.0) * 10))
+        daily_filled = max(0, min(10, daily_filled))
+        daily_bar = "█" * daily_filled + "░" * (10 - daily_filled)
 
         timer_part = ""
         icon = ""
@@ -522,7 +522,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
                 icon = "🌙"
-                timer_part = f"Reset in {calc_reset_str}"
+                timer_part = f"{calc_reset_str}"
                 status_text = "Limit Wait"
                 self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
                 
@@ -552,7 +552,7 @@ class TFCCourseworkMenuApp(rumps.App):
 
         # 3. Update Reflection Draft UI
         if is_limit_wait or is_retrying_after_midnight:
-            self.menu_reflection.title = "🌙 Limit Wait Active — Next reflection will auto-generate at 12:00 AM local time"
+            self.menu_reflection.title = "🌙 Limit Wait (Next draft at 12:00 AM)"
             self.item_refl_preview.title = "Draft: None ready"
         elif self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
             self.menu_reflection.title = "📝 Drafted Reflection (Copy to Clipboard)"
@@ -603,9 +603,9 @@ class TFCCourseworkMenuApp(rumps.App):
         elif display == "full":
             disp_status = timer_part if timer_part else status_text
             if bot_active and lesson_title_trunc and timer_part:
-                self.title = f"{lesson_title_trunc}{disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h today"
+                self.title = f"{lesson_title_trunc}{disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h"
             else:
-                self.title = f"{icon} {disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h today"
+                self.title = f"{icon} {disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h"
             
         elif display == "minimal":
             if new_state_id == "IDLE":
@@ -614,7 +614,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 if is_retrying_after_midnight and diff_s == 0:
                     short_timer = "Retry"
                 else:
-                    short_timer = f"{h_rem}h" if h_rem > 0 else f"{m_rem}m"
+                    short_timer = f"{h_rem:02d}h {m_rem:02d}m" if h_rem > 0 else f"{m_rem}m"
             else:
                 if read_timer_str != "N/A":
                     short_timer = read_timer_str.split("m")[0] + "m" if "m" in read_timer_str else read_timer_str.split(":")[0] + "m"
