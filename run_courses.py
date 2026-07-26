@@ -57,6 +57,7 @@ PASSWORD = os.getenv("TFC_PASSWORD", "")
 BASE_URL = os.getenv("TFC_BASE_URL", "https://www.thefoundationofchange.org")
 LOG_FILE = os.getenv("TFC_LOG_FILE", os.path.join(ROOT_DIR, "automation.log"))
 EVENTS_FILE = os.getenv("TFC_EVENTS_FILE", os.path.join(ROOT_DIR, "events.jsonl"))
+COMPLETED_COURSES_FILE = os.getenv("TFC_COMPLETED_COURSES_FILE", os.path.join(ROOT_DIR, "completed_courses.json"))
 
 SCROLL_INTERVAL_S = 165   # ~2.75 min
 POLL_INTERVAL_S   = 25    # timer poll frequency
@@ -586,6 +587,21 @@ async def fetch_coursework_catalog(page) -> tuple[list[LessonEntry], Optional[st
     log.info(f"Catalog: {len(lessons)} lessons ({done} done, {cont} continue, {start} start)")
     if cta_url:
         log.info(f"   CTA continue: {cta_url}")
+
+    completed_titles = [l.title for l in lessons if l.status == "done"]
+    try:
+        with open(os.path.join(ROOT_DIR, "completed_courses.json"), "w", encoding="utf-8") as f:
+            json.dump({"count": len(completed_titles), "courses": completed_titles, "updated": datetime.now().isoformat()}, f, indent=2)
+        log.info("╭────────────────────────────────────────────────────────╮")
+        log.info("│ 🎓 COMPLETED COURSES LIST                              │")
+        log.info("├────────────────────────────────────────────────────────┤")
+        for i, title in enumerate(completed_titles, 1):
+            log.info(f"│ {i}. {title}")
+        log.info("╰────────────────────────────────────────────────────────╯")
+    except Exception as e:
+        log.error(f"Failed to save completed courses: {e}")
+    log_event("completed_courses_snapshot", count=len(completed_titles), courses=completed_titles)
+
     log_event("catalog_snapshot", total=len(lessons), done=done,
               continue_count=cont, start=start, cta_url=cta_url)
     return lessons, cta_url
@@ -1133,6 +1149,24 @@ async def process_lesson(
 
     prog_after = await get_progress(page)
     hours_gained = max(0.0, prog_after["done"] - prog_before["done"])
+
+    if success:
+        completed_path = os.path.join(ROOT_DIR, "completed_courses.json")
+        try:
+            with open(completed_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                courses = data.get("courses", [])
+        except Exception:
+            courses = []
+        if lesson.title not in courses:
+            courses.append(lesson.title)
+        try:
+            with open(completed_path, "w", encoding="utf-8") as f:
+                json.dump({"count": len(courses), "courses": courses, "updated": datetime.now().isoformat()}, f, indent=2)
+            log_event("completed_courses_snapshot", count=len(courses), courses=courses)
+        except Exception as e:
+            log.error(f"Failed to update completed courses: {e}")
+
     return success, hours_gained
 
 
@@ -1304,6 +1338,25 @@ async def main():
                       success=success, hours_gained=hours_gained, hours_done=prog["done"],
                       hours_today=hours_today, hours_remaining=prog["remaining"],
                       session_done=session_done, catalog_done=rs.catalog_done)
+                      
+            # Save to completed_courses.json
+            if success:
+                completed_list = []
+                try:
+                    if os.path.exists(COMPLETED_COURSES_FILE):
+                        with open(COMPLETED_COURSES_FILE, "r", encoding="utf-8") as f:
+                            completed_list = json.load(f)
+                except Exception:
+                    pass
+                if not any(c.get("title") == lesson.title for c in completed_list):
+                    completed_list.append({
+                        "title": lesson.title,
+                        "url": lesson.url,
+                        "completed_at": datetime.now().isoformat()
+                    })
+                    with open(COMPLETED_COURSES_FILE, "w", encoding="utf-8") as f:
+                        json.dump(completed_list, f, indent=2)
+                    log.info(f"✅ Saved completed course {lesson.title!r} to completed_courses.json")
 
             if prog["remaining"] <= 0:
                 log.info("🎉 All hours complete!")

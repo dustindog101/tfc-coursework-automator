@@ -17,6 +17,7 @@ import rumps
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 EVENTS_FILE = os.path.join(ROOT_DIR, "events.jsonl")
 LOG_FILE = os.path.join(ROOT_DIR, "automation.log")
+COMPLETED_COURSES_FILE = os.path.join(ROOT_DIR, "completed_courses.json")
 SCRIPT_PATH = os.path.join(ROOT_DIR, "run_courses.py")
 ENV_FILE = os.path.join(ROOT_DIR, ".env")
 LAUNCH_AGENT_PATH = os.path.expanduser("~/Library/LaunchAgents/com.tfc.automator.plist")
@@ -63,6 +64,10 @@ class TFCCourseworkMenuApp(rumps.App):
         # ── 1. Status ──────────────────────────────────────────
         self.item_status = rumps.MenuItem("⚙️ Initializing...", callback=None)
         
+        # ── 1.5. Completed Courses ──────────────────────────────
+        self.menu_completed = rumps.MenuItem("🎓 Completed Courses")
+        self.menu_completed.add(rumps.MenuItem("No completed courses yet"))
+
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
         self.item_queue_lesson = rumps.MenuItem("📌 Active Lesson: None")
@@ -85,6 +90,12 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_refl_preview = rumps.MenuItem("Draft: None ready")
         self.item_refl_copy = rumps.MenuItem("📋 Copy Reflection", callback=self.copy_reflection)
         self.menu_reflection.update([self.item_refl_preview, self.item_refl_copy])
+        
+        # ── 4.5. Completed Courses ───────────────────────────────────────────
+        self.menu_completed_courses = rumps.MenuItem("🎓 Completed Courses")
+        self.item_bot_completed = rumps.MenuItem("🤖 Bot Completed Courses (0)")
+        self.item_site_completed = rumps.MenuItem("🌐 All Site Completed (0)")
+        self.menu_completed_courses.update([self.item_bot_completed, self.item_site_completed])
         
         # ── 5. User Profile & Court Proof ──────────────────────────────────
         self.menu_profile = rumps.MenuItem("👤 User Profile & Court Proof")
@@ -140,9 +151,14 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu = [
             self.item_status,
             None,
+            self.menu_completed,
             self.menu_queue,
             self.menu_timers,
             self.menu_reflection,
+            
+            # ── Completed Courses ────────────────────────────────────────────────
+            self.menu_completed_courses,
+            
             self.menu_profile,
             self.menu_history,
             self.menu_settings,
@@ -435,6 +451,12 @@ class TFCCourseworkMenuApp(rumps.App):
                         self.upcoming_reflection = refl
                         break
                         
+            # Latest catalog_snapshot for total site completed
+            for ev in reversed(events):
+                if ev.get("event") == "catalog_snapshot":
+                    self.site_completed = ev.get("done", 0)
+                    break
+                        
             # Latest timer_tick
             for ev in reversed(events):
                 if ev.get("event") == "timer_tick":
@@ -503,6 +525,32 @@ class TFCCourseworkMenuApp(rumps.App):
                 for h in history_items:
                     self.menu_history.add(rumps.MenuItem(h))
                     
+        # 1.5 Update Completed Courses UI
+        completed_path = os.path.join(ROOT_DIR, "completed_courses.json")
+        completed_courses = []
+        completed_count = 0
+        if os.path.exists(completed_path):
+            try:
+                with open(completed_path, "r", encoding="utf-8") as f:
+                    comp_data = json.load(f)
+                    completed_courses = comp_data.get("courses", [])
+                    completed_count = comp_data.get("count", 0)
+            except Exception:
+                pass
+
+        done_f = float(self.progress.get("done", 0.0))
+        total_f = float(self.progress.get("total", 0.0))
+        
+        self.menu_completed.title = f"🎓 Completed Courses ({completed_count})"
+        self.menu_completed.clear()
+        if completed_count > 0:
+            self.menu_completed.add(rumps.MenuItem(f"✅ Total Completed: {completed_count} courses ({done_f:.1f} / {total_f:.0f}h)"))
+            self.menu_completed.add(None)
+            for idx, course_title in enumerate(completed_courses, 1):
+                self.menu_completed.add(rumps.MenuItem(f"{idx}. {course_title}"))
+        else:
+            self.menu_completed.add(rumps.MenuItem("No completed courses yet"))
+
         # 2. Update Profile & Progress UI
         name = self.profile.get("FULL NAME") or self.profile.get("name") or "Unknown"
         email = self.profile.get("EMAIL (READ-ONLY)") or self.profile.get("email") or "Unknown"
@@ -663,6 +711,20 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_refl_preview.title = f"Draft: \"{preview}\""
         else:
             self.item_refl_preview.title = "Draft: None ready"
+
+        # Update Completed Courses UI
+        bot_completed_count = 0
+        if os.path.exists(COMPLETED_COURSES_FILE):
+            try:
+                with open(COMPLETED_COURSES_FILE, "r", encoding="utf-8") as f:
+                    bot_completed_list = json.load(f)
+                    bot_completed_count = len(bot_completed_list)
+            except Exception:
+                pass
+                
+        site_completed = getattr(self, "site_completed", 0)
+        self.item_bot_completed.title = f"🤖 Bot Completed Courses ({bot_completed_count})"
+        self.item_site_completed.title = f"🌐 All Site Completed ({site_completed})"
 
         # Apply Display Mode Title
         prog_part = f"{done_f:.1f}/{total_f:g}h"
