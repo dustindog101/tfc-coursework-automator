@@ -1093,6 +1093,20 @@ async def process_lesson(
     return success, hours_gained
 
 
+def rotate_logs_if_large():
+    """Truncate logs to the last 200 lines if they exceed 100 KB."""
+    for filepath in [LOG_FILE, EVENTS_FILE]:
+        try:
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 100 * 1024:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-200:])
+                log.info(f"Rotated {os.path.basename(filepath)} (was > 100 KB)")
+        except Exception as e:
+            log.warning(f"Failed to rotate {filepath}: {e}")
+
+
 async def main():
     global RUN_STATE
 
@@ -1103,6 +1117,7 @@ async def main():
     log.info("╰────────────────────────────────────────────────────────╯")
 
     log_event("bot_start", version=4)
+    rotate_logs_if_large()
 
     hours_today_start = get_today_hours_from_log()
     log.info(f"📅 Hours logged today (from events.jsonl): {hours_today_start:.1f}h")
@@ -1110,7 +1125,7 @@ async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=not bool(os.getenv("HEADED")),
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--blink-settings=imagesEnabled=true"],
         )
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 900},
@@ -1123,6 +1138,8 @@ async def main():
 
         if not await ensure_auth(page):
             log.error("Auth failed. Exiting.")
+            await page.close()
+            await ctx.close()
             await browser.close()
             sys.exit(1)
 
@@ -1150,6 +1167,8 @@ async def main():
 
         if prog["remaining"] <= 0:
             log.info("🎉 All hours complete!")
+            await page.close()
+            await ctx.close()
             await browser.close()
             return
 
@@ -1254,6 +1273,8 @@ async def main():
         log_event("bot_stop", lessons_this_run=session_done,
                   hours_done=prog["done"], hours_today=hours_today)
         set_terminal_title(f"TFC stopped · session {session_done} done · {prog['done']:.1f}/{prog['total']:.0f}h")
+        await page.close()
+        await ctx.close()
         await browser.close()
 
 
