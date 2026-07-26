@@ -530,15 +530,6 @@ class TFCCourseworkMenuApp(rumps.App):
         is_limit_wait = False
         is_retrying_after_midnight = False
 
-        if events:
-            for ev in reversed(events):
-                if ev.get("event") == "timer_tick":
-                    self.current_lesson = ev.get("lesson_title", self.current_lesson)
-                    if not self.current_lesson.startswith("Lesson #"):
-                        self.current_lesson = f"Lesson #{self.current_lesson}"
-                    
-                    timer_secs = ev.get("timer_secs", 0)
-                    mins, secs = divmod(timer_secs, 60)
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -553,15 +544,16 @@ class TFCCourseworkMenuApp(rumps.App):
                             break
                         if "[READ]" in line or "[REFLECT]" in line:
                             is_limit_wait = False
-                                m_l = re.search(r"Lesson #[^\s']+", line)
-                                if m_l:
-                                    self.current_lesson = m_l.group(0)
-                                m_t = re.search(r"⏱\s*(\d+:\d+|\d+h\s*\d+m)", line)
-                                if m_t:
-                                    if "[READ]" in line:
-                                        read_timer_str = m_t.group(1)
-                                    else:
-                                        submit_timer_str = m_t.group(1)
+                            m_l = re.search(r"Lesson #[^\s']+", line)
+                            if m_l and (not self.current_lesson or self.current_lesson == "None"):
+                                self.current_lesson = m_l.group(0)
+                            m_t = re.search(r"⏱\s*(\d+min(?:\s*remaining)?|\d+:\d+|\d+h\s*\d+m)", line)
+                            if m_t:
+                                parsed_time = m_t.group(1).replace("min remaining", "m").replace("min", "m").strip()
+                                if "[READ]" in line and read_timer_str == "N/A":
+                                    read_timer_str = parsed_time
+                                elif "[REFLECT]" in line and submit_timer_str == "N/A":
+                                    submit_timer_str = parsed_time
                             break
             except Exception:
                 pass
