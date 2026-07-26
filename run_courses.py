@@ -22,12 +22,12 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -290,15 +290,16 @@ def live_status(phase: str, timer_secs: int, lesson_title: str,
 
 # ── agy reflection via CLI pipe ───────────────────────────────────────────────
 _FALLBACKS = [
-    "this was actually really interesting. the info about how the brain reacts to substances made me think differently about addiction. didnt realize how much it impacts the whole body not just the mind.",
-    "i think the biggest thing i got from this is that people dealing with addiction arent just making bad choices, theres actual science behind why its so hard to stop. makes me more understanding.",
-    "the article brought up some stuff i hadnt considered before. like the idea that community and support really do make a difference in recovery. that resonated with me more than i expected honestly.",
-    "it was good to learn about the research behind this topic. i feel like i understand now why certain approaches to treatment work better. gave me a new perspective on things.",
-    "this lesson was helpful in understanding that change is a process not just a decision. the examples made it clear that real growth takes time and that setbacks are part of it.",
-    "what stood out most was how the article connected individual choices to bigger community impacts. its something i want to keep in mind going forward.",
-    "honestly this covered alot more than i thought it would. the part about evidence based approaches was new to me and it actually makes sense why those methods are used.",
-    "i learned that accountability and self awareness are key for making changes that stick. reading this made me reflect on areas where i could apply some of these ideas.",
+    "this article was actually pretty interesting. i didnt realize how much addiction affects the brain and body, not just choices people make. made me think about things differently.",
+    "the biggest thing i took away is that recovery isnt just about stopping, its about rebuilding habits and getting support. the info on community help made sense to me.",
+    "i learned that change takes time and setbacks happen. reading this made me understand why certain treatment approaches work better than just willpower alone.",
+    "honestly this gave me a new perspective on how addiction impacts families and communities too. its not just an individual problem and support really does matter.",
 ]
+
+_AGY_LIMIT_MARKERS = (
+    "quota", "rate limit", "rate-limit", "429", "exhausted",
+    "too many requests", "resource exhausted", "limit reached",
+)
 
 def _strip_em_dash(t: str) -> str:
     return t.replace("\u2014", ",").replace("\u2013", ",").replace("—", ",").replace("–", ",")
@@ -329,6 +330,11 @@ def _extract_prose(text: str) -> str:
     return prose[:REFLECTION_MAX]
 
 
+def _agy_hit_limit(result: subprocess.CompletedProcess) -> bool:
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    return any(marker in text for marker in _AGY_LIMIT_MARKERS)
+
+
 def _build_opencode_cmd(system_prompt: str) -> tuple[list[str], Optional[str]]:
     """
     Build opencode argv. Always attach prompt via -f after the user message.
@@ -345,7 +351,7 @@ def _build_opencode_cmd(system_prompt: str) -> tuple[list[str], Optional[str]]:
 
 def _run_llm_prompt(system_prompt: str) -> Optional[str]:
     """
-    Try agy → opencode (mimo) → Gemini API → return None.
+    Try agy → opencode (mimo) → return None.
     Returns clean reflection text or None on all failures.
     """
     # ── 1. Try agy ────────────────────────────────────────────────────────────
@@ -360,12 +366,10 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
                 log.info(f"agy reflection ({len(text)} chars): {text!r}")
                 return text
             log.warning(f"agy output too short ({len(text)} chars): {text!r}")
+        elif _agy_hit_limit(result):
+            log.warning("agy quota/rate limit hit — trying opencode fallback")
         else:
-            stderr = result.stderr[:300]
-            if any(k in stderr.lower() for k in ["quota", "rate", "limit", "429", "exhausted"]):
-                log.warning("agy quota/rate limit hit — trying opencode fallback")
-            else:
-                log.warning(f"agy exit {result.returncode}: {stderr}")
+            log.warning(f"agy exit {result.returncode}: {(result.stderr or result.stdout)[:300]}")
     except subprocess.TimeoutExpired:
         log.warning("agy timed out (60s) — trying opencode fallback")
     except FileNotFoundError:
@@ -401,41 +405,6 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
             except Exception:
                 pass
 
-    # ── 3. Try Gemini API directly (HTTP fallback) ────────────────────────────
-    try:
-        api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
-        if not api_key:
-            agy_cfg = os.path.expanduser("~/.config/agy/config.json")
-            if os.path.exists(agy_cfg):
-                with open(agy_cfg, encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("key", "")
-        if api_key:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.0-flash:generateContent?key={api_key}"
-            )
-            payload = json.dumps({
-                "contents": [{"parts": [{"text": system_prompt}]}],
-                "generationConfig": {"temperature": 0.8, "maxOutputTokens": 300},
-            }).encode()
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            prose = _extract_prose(_clean_llm_text(text))
-            if len(prose) >= REFLECTION_MIN:
-                log.info(f"gemini-api reflection ({len(prose)} chars): {prose!r}")
-                return prose
-            log.warning(f"gemini-api output too short ({len(prose)} chars)")
-        else:
-            log.warning("No GEMINI_API_KEY found — skipping Gemini API fallback")
-    except Exception as e:
-        log.warning(f"Gemini API fallback error: {e}")
-
     return None
 
 
@@ -462,10 +431,13 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
         return result
 
     # ── 3. Hardcoded fallback ─────────────────────────────────────────────────
-    idx = int(time.time() / 3600) % len(_FALLBACKS)
-    r = _FALLBACKS[idx]
-    log.warning(f"agy, opencode, and gemini-api failed — using hardcoded fallback [{idx}] ({len(r)} chars)")
+    r = random.choice(_FALLBACKS)
+    log.warning(f"agy and opencode failed — using hardcoded fallback ({len(r)} chars)")
     return r
+
+
+def default_reflect_prompt(title: str) -> str:
+    return f"What key lessons and insights did you take away from reading '{title}'?"
 
 
 # ── Browser utils ─────────────────────────────────────────────────────────────
@@ -549,187 +521,89 @@ async def get_progress(page) -> dict:
     return {"done": 0.0, "total": 75.0, "remaining": 75.0}
 
 
-async def extract_article(page) -> tuple[str, str, str]:
-    """Extract (title, body, lesson_prompt) from the article reading page."""
+async def extract_article(page) -> tuple[str, str]:
+    """Extract (title, body) from the article reading page only."""
     title = "Community Service Article"
-    body  = "community service, personal growth, and community impact"
-    lesson_prompt = ""
+    body = ""
     try:
-        # ── Title: try multiple selectors in priority order ───────────────────
-        title_selectors = [
-            "h1", ".article-title", ".lesson-title", ".course-title",
-            "[class*='title']", "[class*='heading']", "h2"
-        ]
-        for sel in title_selectors:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    t = (await el.inner_text()).strip()
-                    if 5 < len(t) < 200 and "Foundation" not in t and "Log" not in t:
-                        title = t
-                        break
-            except Exception:
-                continue
+        for sel in ["h1", "h2", ".article-title", ".lesson-title", ".course-title"]:
+            el = page.locator(sel).first
+            if await el.count() > 0:
+                t = (await el.inner_text()).strip()
+                if 5 < len(t) < 200 and "Foundation" not in t and "Log" not in t:
+                    title = t
+                    break
 
-        # ── Body + Lesson Prompt: single JS evaluation pass ────────────────
-        result = await page.evaluate('''() => {
-            const CLUTTER_WORDS = [
+        if "/reflect" in page.url:
+            log.info("   extract_article: on /reflect page — skipping body extraction")
+            return title, body
+
+        extracted_body = await page.evaluate('''() => {
+            const CLUTTER = [
                 "time remaining", "navigation", "dashboard", "log out", "logout",
-                "reflection submitted", "submit", "next article", "great work",
-                "sign in", "sign out", "copyright", "all rights reserved",
-                "cookie", "privacy policy", "terms of service"
+                "reflection submitted", "submit reflection", "next article", "great work",
+                "sign in", "sign out", "copyright", "privacy policy", "terms of service",
+                "please share your thoughts", "write your reflection here"
             ];
             const CLUTTER_TAGS = new Set(["button", "nav", "footer", "header", "script", "style", "noscript"]);
-            const MIN_PARA_LEN = 40;
-            // These are the GENERIC site-wide prompts that appear on /reflect — exclude from body and prompt
-            const GENERIC_PROMPTS = [
-                "please share your thoughts on the article you just read.",
-                "what did you take away from this article?",
-                "write your reflection here",
-                "enter your response",
-                "how relevant was the information",
-                "what improvements, if any",
-                "do you have any other feedback"
-            ];
-
-            // Detect if we're on the /reflect page (not the article reading page)
-            const isReflectPage = window.location.pathname.endsWith("/reflect");
-
-            function isGenericPrompt(text) {
-                const lower = text.trim().toLowerCase();
-                for (let gp of GENERIC_PROMPTS) { if (lower.startsWith(gp)) return true; }
-                return false;
-            }
+            const MIN_LEN = 40;
 
             function isClutter(el, text) {
                 if (CLUTTER_TAGS.has(el.tagName.toLowerCase())) return true;
                 if (el.closest("nav, footer, header, [role='navigation']")) return true;
                 const lower = text.toLowerCase();
-                for (let w of CLUTTER_WORDS) { if (lower.includes(w)) return true; }
-                if (isGenericPrompt(text)) return true;
+                for (const word of CLUTTER) { if (lower.includes(word)) return true; }
                 return false;
             }
 
-            function isGoodPrompt(text) {
-                if (!text || text.trim().length < 15) return false;
-                if (isGenericPrompt(text)) return false;
-                const lower = text.trim().toLowerCase();
-                return (
-                    text.includes("?") ||
-                    lower.startsWith("describe") ||
-                    lower.startsWith("explain") ||
-                    lower.startsWith("how") ||
-                    lower.startsWith("what") ||
-                    lower.startsWith("why") ||
-                    lower.startsWith("reflect") ||
-                    lower.startsWith("think about") ||
-                    lower.startsWith("share") ||
-                    lower.startsWith("discuss")
-                );
+            let container = document.querySelector("article, main, .prose, .article-body, .lesson-content, #content");
+            let elements = [];
+            if (container) {
+                elements = Array.from(container.querySelectorAll("p, h2, h3, h4, li"));
+                if (elements.length === 0) elements = [container];
+            } else {
+                elements = Array.from(document.querySelectorAll("p, li"));
             }
 
-            // ── Lesson Prompt Extraction ─────────────────────────────────────
-            // Priority 1: Numbered <li> items at the bottom (e.g. "1. What physical symptoms...")
-            // These are the actual per-lesson reflection questions embedded in the article
-            let lessonPrompt = "";
-            if (!isReflectPage) {
-                const liEls = Array.from(document.querySelectorAll("li"));
-                for (let el of liEls) {
-                    if (el.closest("nav, footer, header")) continue;
-                    const t = (el.innerText || "").trim();
-                    // Numbered reflection questions look like "1. Have you ever..." or "2. If you reflect..."
-                    if (/^\\d+\\.\\s+/.test(t) && isGoodPrompt(t) && t.length < 500) {
-                        lessonPrompt = t.replace(/^\\d+\\.\\s+/, "").trim();
-                        break;
-                    }
-                }
-
-                // Priority 2: Class-based selectors
-                if (!lessonPrompt) {
-                    for (let sel of [".reflection-prompt", ".reflection-question", ".prompt", ".question",
-                                     "[class*='prompt']", "[class*='question']", "blockquote", "h2", "h3", "h4"]) {
-                        const els = Array.from(document.querySelectorAll(sel));
-                        for (let el of els) {
-                            if (el.closest("nav, footer, header")) continue;
-                            const t = (el.innerText || "").trim();
-                            if (isGoodPrompt(t) && t.length < 400) { lessonPrompt = t; break; }
-                        }
-                        if (lessonPrompt) break;
-                    }
-                }
-
-                // Priority 3: <p> tags with question marks
-                if (!lessonPrompt) {
-                    for (let el of document.querySelectorAll("p")) {
-                        if (el.closest("nav, footer, header")) continue;
-                        const t = (el.innerText || "").trim();
-                        if (isGoodPrompt(t) && t.includes("?") && t.length < 400) {
-                            lessonPrompt = t; break;
-                        }
-                    }
-                }
+            const seen = new Set();
+            const texts = [];
+            for (const el of elements) {
+                const text = (el.innerText || "").trim();
+                if (!text || text.length < MIN_LEN) continue;
+                if (seen.has(text) || isClutter(el, text)) continue;
+                seen.add(text);
+                texts.push(text);
+                if (texts.join("\\n\\n").length > 3500) break;
             }
-
-            // ── Body Extraction ──────────────────────────────────────────────
-            // Only extract body on the article reading page, not /reflect
-            let bodyText = "";
-            if (!isReflectPage) {
-                const CONTAINER_SELS = [
-                    "article", "main", ".prose", ".article-body", ".lesson-content",
-                    ".course-content", "#content", "[class*='content']", "[class*='article']",
-                    "[class*='lesson']", "[class*='course']"
-                ];
-                let container = null;
-                for (let sel of CONTAINER_SELS) {
-                    const el = document.querySelector(sel);
-                    if (el) { container = el; break; }
-                }
-
-                let elements = [];
-                if (container) {
-                    elements = Array.from(container.querySelectorAll("p, h2, h3, h4, li"));
-                    if (elements.length === 0) elements = [container];
-                }
-                if (elements.length === 0) {
-                    elements = Array.from(document.querySelectorAll("p, li"));
-                }
-
-                const seen = new Set();
-                const texts = [];
-                for (let el of elements) {
-                    const text = (el.innerText || "").trim();
-                    if (!text || text.length < MIN_PARA_LEN) continue;
-                    if (seen.has(text)) continue;
-                    if (isClutter(el, text)) continue;
-                    // Skip numbered reflection question li items from body (they're the prompt)
-                    if (/^\\d+\\.\\s+/.test(text) && text.includes("?")) continue;
-                    seen.add(text);
-                    texts.push(text);
-                    if (texts.join("\\n\\n").length > 3500) break;
-                }
-                bodyText = texts.join("\\n\\n");
-            }
-
-            return { body: bodyText, prompt: lessonPrompt, isReflectPage };
+            return texts.join("\\n\\n");
         }''')
 
-        if result.get("isReflectPage"):
-            log.info("   extract_article: on /reflect page — body/prompt skipped (will use fallback)")
-
-        if result.get("body") and len(result["body"].strip()) > 80:
-            body = result["body"][:3000]
-        else:
-            body = ""
-
-        if result.get("prompt"):
-            lesson_prompt = result["prompt"].strip()
-            log.info(f"   Lesson prompt from article page: {lesson_prompt!r}")
-        elif not result.get("isReflectPage"):
-            log.info("   No lesson-specific prompt found on article page")
-
+        if extracted_body and len(extracted_body.strip()) > 80:
+            body = extracted_body[:3000]
     except Exception as e:
         log.warning(f"article extract: {e}")
-    return title, body, lesson_prompt
+    return title, body
+
+
+async def extract_reflect_prompt(page, title: str) -> str:
+    """Read the reflection instructions from the /reflect page."""
+    try:
+        prompt = await page.evaluate('''() => {
+            const form = document.querySelector("form");
+            if (!form) return "";
+            const paras = Array.from(form.parentElement ? form.parentElement.querySelectorAll("p") : []);
+            for (const p of paras) {
+                const text = (p.innerText || "").trim();
+                if (text.length >= 40 && text.length <= 500) return text;
+            }
+            return "";
+        }''')
+        if prompt:
+            log.info(f"   Reflect page prompt: {prompt[:120]!r}")
+            return prompt
+    except Exception as e:
+        log.warning(f"reflect prompt extract: {e}")
+    return default_reflect_prompt(title)
 
 
 async def safe_goto(page, url: str, retries: int = 3) -> bool:
@@ -1041,11 +915,14 @@ async def reading_phase(
     if not await safe_goto(page, lesson.url):
         raise RuntimeError(f"Could not open reading page for {lesson.title!r}")
 
-    title, body, lesson_prompt = await extract_article(page)
+    title, body = await extract_article(page)
     log.info(f"   Article: {title!r}")
-    if not lesson_prompt:
-        lesson_prompt = f"What key lessons did you take away from reading '{title}'?"
-        log.info(f"   No specific prompt on article page — using title fallback")
+    if not body:
+        body = (
+            f"This article covered important topics related to {title}. "
+            "It discussed community impact, personal responsibility, and evidence-based approaches."
+        )
+    lesson_prompt = default_reflect_prompt(title)
 
     loop = asyncio.get_event_loop()
     agy_task = loop.run_in_executor(
@@ -1066,7 +943,6 @@ async def reading_phase(
 async def reflect_phase(
     page, lesson: LessonEntry, art_title: str, art_body: str, pre_reflection: str,
     hours_done: float, hours_today: float, hours_total: float,
-    lesson_prompt: str = "",
     rs: Optional[RunState] = None,
 ) -> bool:
     reflect_url = lesson.url.rstrip("/") + "/reflect"
@@ -1083,17 +959,13 @@ async def reflect_phase(
         log.info(f"   ✓ Already submitted: {art_title!r}")
         return True
 
-    # Use the lesson-specific prompt extracted from the article page.
-    # The /reflect page only has a generic prompt; the real question is on the reading page.
-    if not lesson_prompt:
-        lesson_prompt = f"What key lessons and insights did you take away from reading '{art_title}'?"
-        log.info(f"   No lesson prompt passed in — using article-title fallback")
-
+    lesson_prompt = await extract_reflect_prompt(page, art_title)
     log.info(f"Reflection Prompt Question: {lesson_prompt!r}")
 
-    # Always re-call the LLM with the exact extracted prompt at reflect time
-    log.info("   Calling agy for reflection with exact lesson prompt...")
-    reflection = call_agy(art_title, art_body, lesson_prompt)
+    reflection = pre_reflection
+    if not reflection:
+        log.info("   Calling LLM for reflection...")
+        reflection = call_agy(art_title, art_body, lesson_prompt)
 
     log_event("reflection_generated", lesson_title=lesson.title,
               article_title=art_title, reflection=reflection,
@@ -1403,31 +1275,21 @@ async def process_lesson(
         "It discussed community impact, personal responsibility, and evidence-based approaches."
     )
     reflection = ""
-    lesson_prompt = ""
 
     if state == "needs_read":
-        art_title, art_body, reflection, lesson_prompt = await reading_phase(
+        art_title, art_body, reflection, _ = await reading_phase(
             page, lesson, prog["done"], hours_today, prog["total"], rs
         )
     elif state == "needs_reflect":
-        # Navigate to article page to get body + lesson prompt.
-        # Note: if reading is complete the site may redirect to /reflect automatically.
-        # We always explicitly navigate to the base lesson URL (not /reflect) to get real content.
         article_url = lesson.url.rstrip("/").replace("/reflect", "")
         if await safe_goto(page, article_url):
-            # Wait briefly for any redirect to settle
             await page.wait_for_timeout(1500)
-            # If page redirected to /reflect, extract_article returns empty.
-            # Check current URL and log it.
-            current_url = page.url
-            if "/reflect" in current_url:
-                log.info(f"   Article page redirected to /reflect — body/prompt unavailable from redirect")
-            t, b, p = await extract_article(page)
-            if t and t != "Community Service Article":
-                art_title, art_body = t, b
-            if p:
-                lesson_prompt = p
-                log.info(f"   Extracted lesson prompt: {lesson_prompt!r}")
+            if "/reflect" not in page.url:
+                t, b = await extract_article(page)
+                if t and t != "Community Service Article":
+                    art_title = t
+                if b:
+                    art_body = b
         log.info(f"   Reading already complete — going to reflect for {art_title!r}")
 
 
@@ -1435,7 +1297,7 @@ async def process_lesson(
     success = await reflect_phase(
         page, lesson, art_title, art_body, reflection,
         prog_before["done"], hours_today, prog_before["total"],
-        lesson_prompt=lesson_prompt, rs=rs,
+        rs=rs,
     )
 
     prog_after = await get_progress(page)

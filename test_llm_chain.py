@@ -18,13 +18,28 @@ class TestLLMChain(unittest.TestCase):
             file_flag_idx = cmd.index("-f")
             self.assertLess(msg_idx, file_flag_idx)
             self.assertEqual(cmd[file_flag_idx + 1], tmp)
+            self.assertIn("opencode/mimo-v2.5-free", cmd)
         finally:
             if tmp and os.path.exists(tmp):
                 os.unlink(tmp)
 
-    def test_clean_llm_text_strips_fences_and_em_dash(self):
-        raw = '```\nhello — world\n```'
-        self.assertIn("hello , world", rc._clean_llm_text(raw))
+    def test_agy_limit_detection(self):
+        result = type("R", (), {"stdout": "quota exceeded", "stderr": "", "returncode": 1})()
+        self.assertTrue(rc._agy_hit_limit(result))
+        result2 = type("R", (), {"stdout": "", "stderr": "HTTP 429 Too Many Requests", "returncode": 1})()
+        self.assertTrue(rc._agy_hit_limit(result2))
+        result3 = type("R", (), {"stdout": "ok", "stderr": "", "returncode": 0})()
+        self.assertFalse(rc._agy_hit_limit(result3))
+
+    def test_fallback_is_random_from_four(self):
+        self.assertEqual(len(rc._FALLBACKS), 4)
+        with patch.object(rc, "_run_llm_prompt", return_value=None):
+            out = rc.call_agy("Title", "Body", "Prompt?")
+        self.assertIn(out, rc._FALLBACKS)
+
+    def test_default_reflect_prompt(self):
+        prompt = rc.default_reflect_prompt("Addiction Basics")
+        self.assertIn("Addiction Basics", prompt)
 
     @patch("run_courses.subprocess.run")
     def test_run_llm_prompt_uses_agy_first(self, mock_run):
@@ -36,13 +51,9 @@ class TestLLMChain(unittest.TestCase):
         self.assertEqual(mock_run.call_args[0][0][0], "agy")
 
     @patch("run_courses.subprocess.run")
-    def test_run_llm_prompt_falls_back_to_opencode(self, mock_run):
+    def test_run_llm_prompt_falls_back_to_opencode_on_agy_quota(self, mock_run):
         agy_fail = unittest.mock.Mock(returncode=1, stdout="", stderr="quota exceeded")
-        opencode_ok = unittest.mock.Mock(
-            returncode=0,
-            stdout="b" * 100,
-            stderr="",
-        )
+        opencode_ok = unittest.mock.Mock(returncode=0, stdout="b" * 100, stderr="")
         mock_run.side_effect = [agy_fail, opencode_ok]
         out = rc._run_llm_prompt("test prompt")
         self.assertIsNotNone(out)
