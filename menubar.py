@@ -489,63 +489,75 @@ class TFCCourseworkMenuApp(rumps.App):
         calc_reset_str = f"{h_rem:02d}h {m_rem:02d}m"
         calc_reset_str_secs = f"{h_rem:02d}h {m_rem:02d}m {s_rem:02d}s"
 
-        # Make sure done and total are floats for formatting
+        # Make sure variables are numbers for formatting
         try:
             done_f = float(done)
             total_f = float(total)
+            rem_f = float(rem)
         except (ValueError, TypeError):
             done_f = 0.0
             total_f = 0.0
+            rem_f = 0.0
+            
+        try:
+            hrs_today_f = float(getattr(self, 'hours_today', 0.0))
+        except (ValueError, TypeError):
+            hrs_today_f = 0.0
 
         timer_part = ""
-        prog_part = f"{done_f:.1f}/{total_f:g}h"
         icon = ""
         status_text = ""
 
-        new_state_id = ""
-        active_icon = "⏸️"
-        active_status_text = "Paused"
-
-        # Update status and state
+        # Update UI according to active state
         if is_limit_wait or is_retrying_after_midnight:
             new_state_id = "LIMIT"
-            active_icon = "🌙"
             if is_retrying_after_midnight and diff_s == 0:
-                active_status_text = "Reset Check (2m Retry)"
-                self.item_status.title = "🌙 Limit Wait - Retrying Reset"
+                icon = "🔄"
+                timer_part = "2m Retry"
+                status_text = "Retrying Reset"
                 self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
-                active_status_text = f"Reset in {calc_reset_str}"
-                self.item_status.title = "🌙 Limit Wait"
+                icon = "🌙"
+                timer_part = f"Reset in {calc_reset_str}"
+                status_text = "Limit Wait"
                 self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
-            self.item_queue_today.title = f"Logged Today: {self.hours_today:.1f}h / 8.0h (Limit Reached)"
+                
+            self.item_status.title = f"🌙 {status_text}"
+            self.item_queue_today.title = "Logged Today: 8.0h / 8.0h (Limit Reached)"
             
         elif bot_active:
             new_state_id = "ACTIVE"
-            active_icon = "🟢"
+            icon = "🟢"
             if read_timer_str != "N/A":
-                active_icon = "📖"
-                active_status_text = read_timer_str
+                timer_part = read_timer_str
             elif submit_timer_str != "N/A":
-                active_icon = "✍️"
-                active_status_text = f"Submit {submit_timer_str}"
-            else:
-                active_status_text = "Active"
+                icon = "✍️"
+                timer_part = f"Submit {submit_timer_str}"
+            status_text = "Active"
                 
             self.item_status.title = "🟢 Active"
-            self.item_queue_today.title = f"Logged Today: Processing ({done}h total)"
+            self.item_queue_today.title = f"Logged Today: Processing ({done_f}h total)"
             
         else:
             new_state_id = "IDLE"
-            active_icon = "⏸️"
-            active_status_text = "Paused"
+            icon = "⏸️"
+            timer_part = ""
+            status_text = "Paused"
             self.item_status.title = "⏸️ Paused"
-            self.item_queue_today.title = f"Logged Today: Paused ({done:.1f}h total)"
+            self.item_queue_today.title = f"Logged Today: Paused ({done_f:.1f}h total)"
 
         # Apply Display Mode Title
-        if self.display_mode == "auto":
-            self.title = f"{active_icon} {active_status_text} | {done:.1f}/{total:g}h"
-        elif self.display_mode == "timers":
+        prog_part = f"{done_f:.1f}/{total_f:g}h"
+        
+        display = getattr(self, 'display_mode', 'auto')
+        
+        if display == "auto":
+            if timer_part:
+                self.title = f"{icon} {timer_part} | {prog_part}"
+            else:
+                self.title = f"{icon} {status_text} | {prog_part}"
+                
+        elif display == "timers":
             if new_state_id == "LIMIT":
                 self.title = f"🌙 Reset in {calc_reset_str_secs}"
             elif new_state_id == "IDLE":
@@ -558,11 +570,15 @@ class TFCCourseworkMenuApp(rumps.App):
                     self.title = "🟢 Active"
                 else:
                     self.title = " | ".join(timers)
-        elif self.display_mode == "progress":
-            self.title = f"📊 {done:.1f}/{total:.1f}h ({pct}%) | ⏳ {rem:.1f}h Left"
-        elif self.display_mode == "full":
-            self.title = f"{active_icon} {active_status_text} | 📊 {done:.1f}/{total:g}h ({pct}%) | 📅 {self.hours_today:.1f}/8h today"
-        elif self.display_mode == "minimal":
+                    
+        elif display == "progress":
+            self.title = f"📊 {done_f:.1f}/{total_f:.1f}h ({pct}%) | ⏳ {rem_f:.1f}h Left"
+            
+        elif display == "full":
+            disp_status = timer_part if timer_part else status_text
+            self.title = f"{icon} {disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h today"
+            
+        elif display == "minimal":
             if new_state_id == "IDLE":
                 short_timer = "Paused"
             elif new_state_id == "LIMIT":
@@ -577,7 +593,7 @@ class TFCCourseworkMenuApp(rumps.App):
                     short_timer = submit_timer_str.split("m")[0] + "m" if "m" in submit_timer_str else submit_timer_str.split(":")[0] + "m"
                 else:
                     short_timer = "Active"
-            self.title = f"{active_icon} {short_timer}"
+            self.title = f"{icon} {short_timer}"
 
         self.item_queue_lesson.title = f"Active Lesson: {self.current_lesson}"
         self.item_read_timer.title = f"• Reading Timer: {read_timer_str}"
