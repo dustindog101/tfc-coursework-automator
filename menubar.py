@@ -86,19 +86,25 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_refl_copy = rumps.MenuItem("📋 Copy Reflection", callback=self.copy_reflection)
         self.menu_reflection.update([self.item_refl_preview, self.item_refl_copy])
         
-        # ── 5. User Profile & Account Audit ──────────────────────────────────
-        self.menu_profile = rumps.MenuItem("👤 User Profile & Audit")
+        # ── 5. User Profile & Court Proof ──────────────────────────────────
+        self.menu_profile = rumps.MenuItem("👤 User Profile & Court Proof")
         self.item_prof_name = rumps.MenuItem("• Full Name: Checking...")
         self.item_prof_email = rumps.MenuItem("• Email: Checking...")
         self.item_prof_dob = rumps.MenuItem("• DOB: Checking...")
         self.item_prof_cat = rumps.MenuItem("• Offense Category: Checking...")
         self.item_prof_addr = rumps.MenuItem("• Location/Address: Checking...")
         self.item_prof_id = rumps.MenuItem("• Enrollment ID: Checking...")
+        
+        self.item_copy_proof = rumps.MenuItem("📄 Copy Official Proof PDF Link", callback=self.copy_proof_pdf)
+        self.item_copy_court = rumps.MenuItem("⚖️ Copy Court Authorization Letter Link", callback=self.copy_court_letter)
+        self.item_copy_portal = rumps.MenuItem("🔍 Copy Verification Portal Link", callback=self.copy_verify_portal)
+
         self.item_prof_progress = rumps.MenuItem("📊 Total Progress: [███░░░░░░░] 25% (18.8 / 75.0h)")
         self.item_prof_remaining = rumps.MenuItem("• Remaining Hours: 56.2h")
         self.menu_profile.update([
             self.item_prof_name, self.item_prof_email, self.item_prof_dob,
             self.item_prof_cat, self.item_prof_addr, self.item_prof_id, None,
+            self.item_copy_proof, self.item_copy_court, self.item_copy_portal, None,
             self.item_prof_progress, self.item_prof_remaining
         ])
         
@@ -317,6 +323,26 @@ class TFCCourseworkMenuApp(rumps.App):
                 rumps.notification("TFC Automator", "Reflection Copied! 📋", "AI reflection essay copied to system clipboard.")
             except Exception as e:
                 rumps.alert(f"Failed to copy to clipboard: {e}")
+
+    def _copy_to_clipboard(self, text, title, message):
+        try:
+            p = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+            p.communicate(input=text.encode('utf-8'))
+            rumps.notification("TFC Automator", title, message)
+        except Exception as e:
+            rumps.alert(f"Failed to copy to clipboard: {e}")
+
+    def copy_proof_pdf(self, _):
+        link = self.profile.get("OFFICIAL PROOF PDF LINK") or self.profile.get("proof_pdf_link") or "Link not available yet."
+        self._copy_to_clipboard(link, "Proof PDF Copied! 📄", "Official Proof PDF link copied to clipboard.")
+
+    def copy_court_letter(self, _):
+        link = self.profile.get("COURT AUTHORIZATION LETTER") or self.profile.get("court_letter_link") or "Link not available yet."
+        self._copy_to_clipboard(link, "Court Letter Copied! ⚖️", "Court Authorization Letter link copied to clipboard.")
+
+    def copy_verify_portal(self, _):
+        link = self.profile.get("VERIFICATION PORTAL") or self.profile.get("verification_portal_link") or "Link not available yet."
+        self._copy_to_clipboard(link, "Portal Link Copied! 🔍", "Verification Portal link copied to clipboard.")
 
     def open_dashboard(self, _):
         """Open TFC Dashboard in browser."""
