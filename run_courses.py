@@ -337,10 +337,21 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
 
     # ── 2. Try opencode ───────────────────────────────────────────────────────
     try:
-        result = subprocess.run(
-            ["opencode", "run", system_prompt],
-            capture_output=True, text=True, timeout=90, cwd=ROOT_DIR,
-        )
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
+            tmp.write(system_prompt)
+            tmp_path = tmp.name
+        try:
+            result = subprocess.run(
+                ["opencode", "run", "--file", tmp_path, "Write only the reflection text, no preamble."],
+                capture_output=True, text=True, timeout=90, cwd=ROOT_DIR,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
         if result.returncode == 0:
             # opencode outputs the raw response text on stdout
             text = result.stdout.strip().strip('"\'')
