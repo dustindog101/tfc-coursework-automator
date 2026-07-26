@@ -308,18 +308,14 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
     Falls back to rotating hardcoded reflections if agy fails.
     """
     system_prompt = (
-        "You write short reflections for an online community service course. "
-        "STRICT rules:\n"
-        "- Min 80 characters, MAX 295 characters (HARD LIMIT - count carefully)\n"
-        "- NO em dashes (— or –), use commas or periods instead\n"
-        "- Write like an average 19-year-old freshman typing fast on a laptop\n"
-        "- Include small natural mistakes: missing comma, casual grammar\n"
-        "- Be genuine, vary your sentence starters, dont sound like AI\n"
-        "- Return ONLY the reflection text, no quotes, no preamble\n\n"
+        "- Include multiple natural typing and writing errors: missing apostrophes (e.g. 'dont', 'im', 'cant'), minor casual typos, lowercased sentence start, informal phrasing, missing commas.\n"
+        "- Write like an average 19-year-old college student typing fast on a laptop.\n"
+        "- Min 80 characters, MAX 295 characters (HARD LIMIT - count carefully).\n"
+        "- NO em dashes (— or –), NO AI buzzwords ('delve', 'tapestry', 'furthermore', 'crucial').\n"
+        "- Directly answer the Reflection Prompt Question based on the Article Content.\n\n"
         f"Article Title: {article_title}\n"
         f"Article Content:\n{article_body[:2500]}\n"
-        f"Reflection Prompt Question: {prompt_text or 'What did you take away from this article?'}\n\n"
-        "Write the reflection:"
+        f"Reflection Prompt Question: {prompt_text}\n\n"
     )
 
     try:
@@ -496,11 +492,7 @@ async def extract_article(page) -> tuple[str, str]:
         if extracted_body:
             body = extracted_body[:3000]
         else:
-            raw = await page.inner_text("body")
-            if "Time Remaining" in raw:
-                body = raw.split("Time Remaining", 1)[1][10:][:3000]
-            else:
-                body = raw[:3000]
+            body = ""
     except Exception as e:
         log.warning(f"article extract: {e}")
     return title, body
