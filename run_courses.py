@@ -1349,16 +1349,7 @@ async def wait_for_daily_reset(page, rs: RunState):
             last_notify_time = time.time()
             rem_h = secs_remaining // 3600
             rem_m = (secs_remaining % 3600) // 60
-            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (12:00 AM local time). Waiting...")
-
-        if time.time() - last_check_time >= 900:
-            last_check_time = time.time()
-            log.info("🔍 Periodic check: inspecting daily limit status on site...")
-            daily = await get_daily_status(page)
-            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
-                log_event("daily_limit_reset_detected")
-                log.info("🌅 Limit reset confirmed! Resuming coursework...")
-                break
+            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (12:00 AM local time). Resting...")
 
         if secs_remaining <= 0:
             log.info("🌅 Local midnight reached! Checking daily limit status on site...")
@@ -1372,12 +1363,12 @@ async def wait_for_daily_reset(page, rs: RunState):
                 log.info("⏳ Midnight reached! Reset not updated on site yet; retrying in 2 minutes...")
                 await page.wait_for_timeout(120000)
 
-        if time.time() - last_scroll_time >= 120:
+        if time.time() - last_scroll_time >= 300:
             last_scroll_time = time.time()
             try:
-                await page.evaluate("window.scrollBy(0, 100)")
-                await page.wait_for_timeout(300)
-                await page.evaluate("window.scrollBy(0, -100)")
+                await page.evaluate("window.scrollBy(0, 50)")
+                await page.wait_for_timeout(200)
+                await page.evaluate("window.scrollBy(0, -50)")
             except Exception:
                 pass
 
