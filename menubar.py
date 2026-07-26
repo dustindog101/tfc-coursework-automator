@@ -73,7 +73,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu_timers = rumps.MenuItem("⏱️ Active Timers")
         self.item_read_timer = rumps.MenuItem("• Reading Timer: N/A")
         self.item_submit_timer = rumps.MenuItem("• Reflection Submit-Lock Timer: N/A")
-        self.item_limit_timer = rumps.MenuItem("• Midnight Reset Timer: N/A (12:00 AM Local Time)")
+        self.item_limit_timer = rumps.MenuItem("• Midnight Reset Timer: N/A (12:00 AM)")
         self.item_scroll_timer = rumps.MenuItem("• Keep-Alive Scroll Timer: Active (every 2.75m)")
         self.menu_timers.update([
             self.item_read_timer, self.item_submit_timer,
@@ -522,9 +522,9 @@ class TFCCourseworkMenuApp(rumps.App):
                 self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
                 icon = "🌙"
-                timer_part = f"{calc_reset_str}"
+                timer_part = f"Reset in {calc_reset_str}"
                 status_text = "Limit Wait"
-                self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
+                self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM)"
                 
             self.item_status.title = f"🌙 {status_text}"
             self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h - Limit Hit)"
@@ -552,11 +552,11 @@ class TFCCourseworkMenuApp(rumps.App):
 
         # 3. Update Reflection Draft UI
         if is_limit_wait or is_retrying_after_midnight:
-            self.menu_reflection.title = "🌙 Limit Wait (Next draft at 12:00 AM)"
+            self.menu_reflection.title = "🌙 Limit Wait Active (Auto-generates at 12:00 AM)"
             self.item_refl_preview.title = "Draft: None ready"
         elif self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
             self.menu_reflection.title = "📝 Drafted Reflection (Copy to Clipboard)"
-            preview = self.upcoming_reflection[:45] + "..." if len(self.upcoming_reflection) > 45 else self.upcoming_reflection
+            preview = self.upcoming_reflection[:35] + "..." if len(self.upcoming_reflection) > 35 else self.upcoming_reflection
             self.item_refl_preview.title = f"Draft: \"{preview}\""
         else:
             self.menu_reflection.title = "📝 Upcoming AI Reflection"
@@ -570,8 +570,8 @@ class TFCCourseworkMenuApp(rumps.App):
         lesson_title_trunc = ""
         if bot_active and self.current_lesson and self.current_lesson != "None":
             lt = self.current_lesson.replace("Lesson #", "").strip()
-            if len(lt) > 16:
-                lt = lt[:15].strip() + "…"
+            if len(lt) > 12:
+                lt = lt[:11].strip() + "…"
             lesson_title_trunc = f"📖 {lt} • "
 
         if display == "auto":
@@ -629,7 +629,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_submit_timer.title = f"• Reflection Submit-Lock Timer: {submit_timer_str}"
         
         if not is_limit_wait and not is_retrying_after_midnight:
-             self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
+             self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM)"
 
         # Notifications for state transitions (debounced)
         if new_state_id == self.last_state_id:
