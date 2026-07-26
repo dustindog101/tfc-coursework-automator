@@ -466,11 +466,20 @@ class TFCCourseworkMenuApp(rumps.App):
             # Event history items formatted in 12-hour local time
             history_items = []
             for ev in reversed(events):
+                if len(history_items) >= 10:
+                    break
+                
                 time_str = format_local_time(ev.get("ts", ""))
                 t_prefix = f"[{time_str}] " if time_str else ""
                 event_name = ev.get("event", "event")
                 
-                if event_name == "reading_start":
+                if event_name == "user_profile_loaded":
+                    history_items.append(f"{t_prefix}👤 Profile Loaded")
+                elif event_name == "progress_snapshot":
+                    history_items.append(f"{t_prefix}📊 Progress Snapshot ({ev.get('done')}h/{ev.get('total')}h)")
+                elif event_name == "lesson_start":
+                    history_items.append(f"{t_prefix}📖 Started Lesson: {ev.get('lesson_title', 'Lesson')[:25]}")
+                elif event_name == "reading_start":
                     history_items.append(f"{t_prefix}📖 Reading: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "reflect_start":
                     history_items.append(f"{t_prefix}✍️ Reflecting: {ev.get('lesson_title', 'Lesson')[:25]}")
@@ -478,8 +487,6 @@ class TFCCourseworkMenuApp(rumps.App):
                     history_items.append(f"{t_prefix}📝 AI Reflection Ready ({ev.get('chars')} chars)")
                 elif event_name == "reflect_submitted":
                     history_items.append(f"{t_prefix}📤 Submitted Reflection: {ev.get('lesson_title', 'Lesson')[:25]}")
-                elif event_name == "lesson_start":
-                    history_items.append(f"{t_prefix}📖 Started Lesson: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "lesson_complete":
                     history_items.append(f"{t_prefix}✅ Completed: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "daily_limit_hit":
@@ -488,17 +495,8 @@ class TFCCourseworkMenuApp(rumps.App):
                     history_items.append(f"{t_prefix}🌙 Waiting for Midnight Reset")
                 elif event_name == "daily_limit_reset_detected":
                     history_items.append(f"{t_prefix}🌅 Midnight Reset Detected")
-                elif event_name == "scroll_keepalive":
-                    history_items.append(f"{t_prefix}↕ Keep-Alive Session Scroll")
                 elif event_name == "bot_start":
                     history_items.append(f"{t_prefix}🚀 Bot Engine Started")
-                elif event_name == "user_profile_loaded":
-                    history_items.append(f"{t_prefix}👤 User Profile Loaded")
-                elif event_name == "progress_snapshot":
-                    history_items.append(f"{t_prefix}📊 Progress: {ev.get('done')}h/{ev.get('total')}h")
-                
-                if len(history_items) >= 10:
-                    break
                     
             if history_items:
                 self.menu_history.clear()
