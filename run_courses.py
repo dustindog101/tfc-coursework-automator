@@ -316,9 +316,9 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
         "- Include small natural mistakes: missing comma, casual grammar\n"
         "- Be genuine, vary your sentence starters, dont sound like AI\n"
         "- Return ONLY the reflection text, no quotes, no preamble\n\n"
-        f"Article title: {article_title}\n"
-        f"Article content: {article_body[:600]}\n"
-        f"Reflection prompt: {prompt_text or 'What did you take away from this article?'}\n\n"
+        f"Article Title: {article_title}\n"
+        f"Article Content:\n{article_body[:2500]}\n"
+        f"Reflection Prompt Question: {prompt_text or 'What did you take away from this article?'}\n\n"
         "Write the reflection:"
     )
 
@@ -445,18 +445,24 @@ async def extract_article(page) -> tuple[str, str]:
     title = "Community Service Article"
     body  = "community service, personal growth, and community impact"
     try:
-        for sel in ["h1", "h2", ".article-title"]:
+        for sel in ["h1", "h2", ".article-title", ".title"]:
             el = page.locator(sel).first
             if await el.count() > 0:
                 t = (await el.inner_text()).strip()
                 if 5 < len(t) < 200 and "Foundation" not in t:
                     title = t
                     break
-        raw = await page.inner_text("body")
-        if "Time Remaining" in raw:
-            body = raw.split("Time Remaining", 1)[1][10:][:2000]
+                    
+        # Extract actual article body paragraphs
+        paras = await page.locator("p").all_inner_texts()
+        if paras:
+            body = "\n\n".join(p.strip() for p in paras if len(p.strip()) > 20)[:2000]
         else:
-            body = raw[:2000]
+            raw = await page.inner_text("body")
+            if "Time Remaining" in raw:
+                body = raw.split("Time Remaining", 1)[1][10:][:2000]
+            else:
+                body = raw[:2000]
     except Exception as e:
         log.warning(f"article extract: {e}")
     return title, body
@@ -810,11 +816,35 @@ async def reflect_phase(
 
     prompt_text = ""
     try:
-        el = page.locator("p").first
-        if await el.count() > 0:
-            prompt_text = (await el.inner_text()).strip()
+        prompt_text = await page.evaluate('''() => {
+            const sels = ['label[for]', 'h2', 'h3', 'p', '.reflection-question'];
+            for (let sel of sels) {
+                const els = Array.from(document.querySelectorAll(sel));
+                for (let el of els) {
+                    const text = (el.innerText || "").trim();
+                    if (text.toLowerCase().includes("reflect") || text.toLowerCase().includes("?") || text.toLowerCase().includes("take away")) {
+                        return text;
+                    }
+                }
+            }
+            const ta = document.querySelector('textarea');
+            if (ta && ta.placeholder) {
+                return ta.placeholder;
+            }
+            return "";
+        }''')
     except Exception:
         pass
+
+    if not prompt_text:
+        try:
+            el = page.locator("p").first
+            if await el.count() > 0:
+                prompt_text = (await el.inner_text()).strip()
+        except Exception:
+            pass
+
+    log.info(f"Reflection Prompt Question: {prompt_text!r}")
 
     reflection = pre_reflection
     if not reflection:
