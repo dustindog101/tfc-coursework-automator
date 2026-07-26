@@ -58,7 +58,7 @@ class TFCCourseworkMenuApp(rumps.App):
             quit_button=None
         )
         self.profile = {}
-        self.progress = {"done": 18.8, "total": 75.0, "remaining": 56.2}
+        self.progress = {"done": 0.0, "total": 75.0, "remaining": 75.0}
         self.current_lesson = "None"
         self.upcoming_reflection = "No reflection generated yet."
         self.upcoming_reflection_source = ""
@@ -125,7 +125,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_copy_court = rumps.MenuItem("⚖️ Copy Court Authorization Letter Link", callback=self.copy_court_letter)
         self.item_copy_portal = rumps.MenuItem("🔍 Copy Verification Portal Link", callback=self.copy_verify_portal)
 
-        self.item_prof_progress = rumps.MenuItem("📊 Total Progress: [███░░░░░░░] 25% (18.8 / 75.0h)")
+        self.item_prof_progress = rumps.MenuItem("📊 Total Progress: Calculating...")
         self.item_prof_remaining = rumps.MenuItem("• Remaining Hours: 56.2h")
         self.menu_profile.update([
             self.item_prof_name, self.item_prof_email, self.item_prof_dob,
@@ -462,10 +462,20 @@ class TFCCourseworkMenuApp(rumps.App):
                     self.profile = ev
                     break
             
-            # Latest progress snapshot
+            # Latest progress snapshot or hours_done from events
             for ev in reversed(events):
                 if ev.get("event") == "progress_snapshot":
-                    self.progress = ev
+                    self.progress = {
+                        "done": float(ev.get("done", 0.0)),
+                        "total": float(ev.get("total", 75.0)),
+                        "remaining": float(ev.get("remaining", 0.0)),
+                    }
+                    break
+                elif "hours_done" in ev:
+                    h_d = float(ev["hours_done"])
+                    h_tot = float(ev.get("hours_total", 75.0))
+                    h_rem = float(ev.get("hours_remaining", max(0.0, h_tot - h_d)))
+                    self.progress = {"done": h_d, "total": h_tot, "remaining": h_rem}
                     break
                     
             # Latest AI reflection generated
@@ -685,6 +695,16 @@ class TFCCourseworkMenuApp(rumps.App):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
                     for line in reversed(deque(f, maxlen=500)):
+                        # Live progress hours from log (e.g. "TFC 26.8/75h" or "26.8h / 75h")
+                        m_prog = re.search(r"TFC\s+(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)h|(\d+(?:\.\d+)?)h\s*/\s*(\d+(?:\.\d+)?)h", line)
+                        if m_prog:
+                            d_val = float(m_prog.group(1) or m_prog.group(3))
+                            t_val = float(m_prog.group(2) or m_prog.group(4))
+                            if d_val > 0:
+                                self.progress["done"] = d_val
+                                self.progress["total"] = t_val
+                                self.progress["remaining"] = max(0.0, t_val - d_val)
+
                         if "retrying in 2 minutes" in line or "Reset not updated on site yet" in line:
                             is_retrying_after_midnight = True
                         if "[LIMIT_WAIT]" in line or "LIMIT REACHED" in line:
