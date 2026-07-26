@@ -453,16 +453,54 @@ async def extract_article(page) -> tuple[str, str]:
                     title = t
                     break
                     
-        # Extract actual article body paragraphs
-        paras = await page.locator("p").all_inner_texts()
-        if paras:
-            body = "\n\n".join(p.strip() for p in paras if len(p.strip()) > 20)[:2000]
+        extracted_body = await page.evaluate('''() => {
+            let container = document.querySelector('article') || 
+                            document.querySelector('main') || 
+                            document.querySelector('.prose') || 
+                            document.querySelector('#content');
+            
+            let elements = [];
+            if (container) {
+                elements = Array.from(container.querySelectorAll('p, h2, h3, li'));
+                if (elements.length === 0) {
+                    elements = [container];
+                }
+            } else {
+                elements = Array.from(document.querySelectorAll('p'));
+            }
+            
+            const clutter = ["Time Remaining", "Navigation", "Dashboard", "Log Out", "Reflection Submitted", "Submit"];
+            let texts = [];
+            for (let el of elements) {
+                let text = (el.innerText || "").trim();
+                if (!text) continue;
+                
+                let isClutter = false;
+                if (text.length < 50) {
+                    for (let c of clutter) {
+                        if (text.toLowerCase().includes(c.toLowerCase())) {
+                            isClutter = true;
+                            break;
+                        }
+                    }
+                    if (el.tagName.toLowerCase() === 'button') isClutter = true;
+                }
+                
+                if (!isClutter) {
+                    texts.push(text);
+                }
+            }
+            return texts.join('\\n\\n');
+        }''')
+        
+        if extracted_body:
+            body = extracted_body[:3000]
         else:
             raw = await page.inner_text("body")
             if "Time Remaining" in raw:
-                body = raw.split("Time Remaining", 1)[1][10:][:2000]
+                body = raw.split("Time Remaining", 1)[1][10:][:3000]
             else:
-                body = raw[:2000]
+                body = raw[:3000]
     except Exception as e:
         log.warning(f"article extract: {e}")
     return title, body
