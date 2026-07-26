@@ -15,11 +15,12 @@ if [[ ! -f .env ]]; then
 fi
 
 echo "🤖 TFC Bot starting (visible browser, auto-restart on crash)"
+echo "   Running with caffeinate to prevent system sleep (background operation allowed)"
 echo "   Press Ctrl+C to stop"
 echo ""
 
 while true; do
-  python3 run_courses.py
+  caffeinate -i -s python3 run_courses.py
   code=$?
   if [[ $code -eq 0 ]]; then
     echo ""
