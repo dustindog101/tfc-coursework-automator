@@ -79,9 +79,7 @@ class TFCCourseworkMenuApp(rumps.App):
         # ── 1. Status ──────────────────────────────────────────
         self.item_status = rumps.MenuItem("⚙️ Initializing...", callback=None)
         
-        # ── 1.5. Completed Courses ──────────────────────────────
-        self.menu_bot_completed = rumps.MenuItem("🤖 Bot Completed Courses")
-        self.menu_all_completed = rumps.MenuItem("🌐 All Site Completed Courses")
+
 
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
@@ -107,7 +105,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu_reflection.update([self.item_refl_preview, self.item_refl_copy])
         
         # ── 4.5. Completed Courses ───────────────────────────────────────────
-        self.menu_completed_courses = rumps.MenuItem("🎓 Completed Courses")
+        self.menu_completed_courses = rumps.MenuItem("🎓 Completed Courses on Site (0)")
         self.menu_bot_completed = rumps.MenuItem("🤖 Bot Completed Courses (0)")
         self.menu_bot_completed.add(rumps.MenuItem("No courses completed by bot yet"))
         self.menu_site_completed = rumps.MenuItem("🌐 All Site Completed (0)")
@@ -555,7 +553,7 @@ class TFCCourseworkMenuApp(rumps.App):
                     self.menu_history.add(rumps.MenuItem(h))
                     
         # 1.5 Update Completed Courses UI
-        # Bot completed
+        # Bot completed (stored locally in bot_completed_courses.json)
         bot_path = os.path.join(ROOT_DIR, "bot_completed_courses.json")
         bot_courses = []
         bot_count = 0
@@ -563,11 +561,38 @@ class TFCCourseworkMenuApp(rumps.App):
             try:
                 with open(bot_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    bot_courses = data.get("courses", [])
-                    bot_count = data.get("count", 0)
+                    if isinstance(data, dict):
+                        bot_courses = data.get("courses", [])
+                        bot_count = data.get("count", len(bot_courses))
+                    elif isinstance(data, list):
+                        bot_courses = data
+                        bot_count = len(bot_courses)
             except Exception:
                 pass
-                
+
+        # Fallback: scan events.jsonl for lesson_complete events if bot_completed_courses.json is empty
+        if not bot_courses and events:
+            seen_titles = set()
+            for ev in events:
+                if ev.get("event") == "lesson_complete" and ev.get("success", False):
+                    title = ev.get("lesson_title")
+                    if title and title not in seen_titles:
+                        seen_titles.add(title)
+                        bot_courses.append({
+                            "title": title,
+                            "url": ev.get("url", ""),
+                            "ts": ev.get("ts", "")
+                        })
+            if bot_courses:
+                bot_count = len(bot_courses)
+                # Auto-seed bot_completed_courses.json
+                try:
+                    with open(bot_path, "w", encoding="utf-8") as f:
+                        json.dump({"count": bot_count, "courses": bot_courses, "updated": datetime.now().isoformat()}, f, indent=2)
+                except Exception:
+                    pass
+
+        bot_count = max(bot_count, len(bot_courses))
         self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_count})"
         self.safe_clear_menu(self.menu_bot_completed)
             
@@ -580,13 +605,13 @@ class TFCCourseworkMenuApp(rumps.App):
                     ts = format_local_time(c.get("ts", ""))
                     ts_str = f" [{ts}]" if ts else ""
                 else:
-                    t = c
+                    t = str(c)
                     ts_str = ""
                 self.menu_bot_completed.add(rumps.MenuItem(f"{idx}. {t}{ts_str}"))
         else:
             self.menu_bot_completed.add(rumps.MenuItem("No courses completed by bot yet"))
 
-        # All completed
+        # All completed on site
         all_path = os.path.join(ROOT_DIR, "completed_courses.json")
         all_courses = []
         all_count = 0
@@ -594,12 +619,18 @@ class TFCCourseworkMenuApp(rumps.App):
             try:
                 with open(all_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    all_courses = data.get("courses", [])
-                    all_count = data.get("count", 0)
+                    if isinstance(data, dict):
+                        all_courses = data.get("courses", [])
+                        all_count = data.get("count", len(all_courses))
+                    elif isinstance(data, list):
+                        all_courses = data
+                        all_count = len(all_courses)
             except Exception:
                 pass
                 
-        self.menu_site_completed.title = f"🌐 All Site Completed Courses ({all_count})"
+        all_count = max(all_count, len(all_courses))
+        self.menu_completed_courses.title = f"🎓 Completed Courses on Site ({all_count})"
+        self.menu_site_completed.title = f"🌐 All Site Completed ({all_count})"
         self.safe_clear_menu(self.menu_site_completed)
             
         if all_count > 0:
@@ -608,7 +639,8 @@ class TFCCourseworkMenuApp(rumps.App):
             self.menu_site_completed.add(rumps.MenuItem(f"✅ Total Completed: {all_count} ({done_f:.1f} / {total_f:.0f}h)"))
             self.menu_site_completed.add(None)
             for idx, course_title in enumerate(all_courses, 1):
-                self.menu_site_completed.add(rumps.MenuItem(f"{idx}. {course_title}"))
+                t = course_title.get("title", str(course_title)) if isinstance(course_title, dict) else str(course_title)
+                self.menu_site_completed.add(rumps.MenuItem(f"{idx}. {t}"))
         else:
             self.menu_site_completed.add(rumps.MenuItem("No completed courses loaded yet"))
 
@@ -646,6 +678,7 @@ class TFCCourseworkMenuApp(rumps.App):
             submit_timer_str = "N/A"
         limit_timer_str = "N/A"
         is_limit_wait = False
+        log_limit_wait = False
         is_retrying_after_midnight = False
 
         if os.path.exists(LOG_FILE):
@@ -655,13 +688,13 @@ class TFCCourseworkMenuApp(rumps.App):
                         if "retrying in 2 minutes" in line or "Reset not updated on site yet" in line:
                             is_retrying_after_midnight = True
                         if "[LIMIT_WAIT]" in line or "LIMIT REACHED" in line:
-                            is_limit_wait = True
+                            log_limit_wait = True
                             m_rem = re.search(r"⏱\s*(\d+h\s*\d+m)", line)
                             if m_rem:
                                 limit_timer_str = m_rem.group(1)
                             break
                         if "[READ]" in line or "[REFLECT]" in line:
-                            is_limit_wait = False
+                            log_limit_wait = False
                             m_l = re.search(r"Lesson #[^\s']+", line)
                             if m_l and (not self.current_lesson or self.current_lesson == "None"):
                                 self.current_lesson = m_l.group(0)
@@ -676,21 +709,36 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception:
                 pass
 
+        event_limit_wait = False
         is_resuming = False
         if events:
             last_limit_wait = -1
             last_resume = -1
             for idx, ev in enumerate(events):
                 ev_name = ev.get("event")
-                if ev_name == "daily_limit_wait_start":
+                if ev_name in ("daily_limit_wait_start", "daily_limit_hit"):
                     last_limit_wait = idx
-                elif ev_name in ("daily_limit_reset_detected", "reading_start", "lesson_start", "bot_start"):
+                elif ev_name in ("daily_limit_reset_detected", "reading_start", "lesson_start"):
+                    # NOTE: "bot_start" is intentionally NOT included here so logging bot_start DOES NOT clear is_limit_wait
                     last_resume = idx
             
-            if last_resume > last_limit_wait and last_limit_wait != -1:
-                is_limit_wait = False
-                is_retrying_after_midnight = False
+            if last_limit_wait != -1 and last_limit_wait > last_resume:
+                event_limit_wait = True
+            elif last_resume > last_limit_wait and last_limit_wait != -1:
                 is_resuming = True
+
+        try:
+            hrs_today_f = float(getattr(self, 'hours_today', 0.0))
+        except (ValueError, TypeError):
+            hrs_today_f = 0.0
+
+        # Master is_limit_wait determination:
+        # True if hours_today >= 8.0 or log_limit_wait is True or event_limit_wait is True.
+        # Fixes bug where logging bot_start cleared is_limit_wait when hours_today >= 8.0 or [LIMIT_WAIT] active.
+        if hrs_today_f >= 8.0 or log_limit_wait or event_limit_wait:
+            is_limit_wait = True
+        else:
+            is_limit_wait = False
 
         # Calculate time until local midnight (12:00 AM local time)
         now = datetime.now()
@@ -736,7 +784,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
                 icon = "🌙"
-                timer_part = f"Reset in {calc_reset_str}"
+                timer_part = calc_reset_str
                 status_text = "Limit Wait"
                 self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM)"
                 
@@ -774,19 +822,7 @@ class TFCCourseworkMenuApp(rumps.App):
         else:
             self.item_refl_preview.title = "Draft: None ready"
 
-        # Update Completed Courses UI
-        bot_completed_count = 0
-        if os.path.exists(COMPLETED_COURSES_FILE):
-            try:
-                with open(COMPLETED_COURSES_FILE, "r", encoding="utf-8") as f:
-                    bot_completed_list = json.load(f)
-                    bot_completed_count = len(bot_completed_list)
-            except Exception:
-                pass
-                
-        site_completed = getattr(self, "site_completed", 0)
-        self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_completed_count})"
-        self.menu_site_completed.title = f"🌐 All Site Completed ({site_completed})"
+
 
         # Apply Display Mode Title
         prog_part = f"{done_f:.1f}/{total_f:g}h"
@@ -794,7 +830,7 @@ class TFCCourseworkMenuApp(rumps.App):
         display = getattr(self, 'display_mode', 'auto')
         
         lesson_title_trunc = ""
-        if bot_active and self.current_lesson and self.current_lesson != "None":
+        if bot_active and new_state_id == "ACTIVE" and self.current_lesson and self.current_lesson != "None":
             lt = self.current_lesson.replace("Lesson #", "").strip()
             if len(lt) > 12:
                 lt = lt[:11].strip() + "…"

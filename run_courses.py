@@ -1652,38 +1652,6 @@ async def main():
                       hours_today=hours_today, hours_remaining=prog["remaining"],
                       session_done=session_done, catalog_done=rs.catalog_done)
                       
-            # Save to bot_completed_courses.json
-            if success:
-                bot_comp_file = os.path.join(ROOT_DIR, "bot_completed_courses.json")
-                bot_list = []
-                if os.path.exists(bot_comp_file):
-                    try:
-                        with open(bot_comp_file, "r", encoding="utf-8") as f:
-                            bdata = json.load(f)
-                            if isinstance(bdata, dict):
-                                bot_list = bdata.get("courses", [])
-                            elif isinstance(bdata, list):
-                                bot_list = bdata
-                    except Exception:
-                        bot_list = []
-
-                exists = any(
-                    (c.get("title") if isinstance(c, dict) else c) == lesson.title
-                    for c in bot_list
-                )
-                if not exists:
-                    bot_list.append({
-                        "title": lesson.title,
-                        "url": lesson.url,
-                        "ts": datetime.now().isoformat()
-                    })
-                    try:
-                        with open(bot_comp_file, "w", encoding="utf-8") as f:
-                            json.dump({"count": len(bot_list), "courses": bot_list, "updated": datetime.now().isoformat()}, f, indent=2)
-                        log.info(f"✅ Saved bot-completed course {lesson.title!r} to bot_completed_courses.json")
-                    except Exception as e:
-                        log.error(f"Failed to write bot_completed_courses.json: {e}")
-
             if prog["remaining"] <= 0:
                 log.info("🎉 All hours complete!")
                 log_event("all_complete", total_hours=prog["done"])
