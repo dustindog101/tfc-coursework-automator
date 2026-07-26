@@ -66,11 +66,21 @@ DAILY_HOUR_LIMIT  = float(os.getenv("TFC_DAILY_HOUR_LIMIT", "8.0"))
 MIN_HOURS_LEFT    = float(os.getenv("TFC_MIN_HOURS_LEFT", "0.35"))  # don't start if less left today
 
 # ── Logging (text) ────────────────────────────────────────────────────────────
+class TerminalLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            sys.stderr.write("\033[2K\r")
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        except Exception:
+            self.handleError(record)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),
+        TerminalLogHandler(),
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
@@ -234,17 +244,25 @@ def format_status_line(rs: RunState) -> str:
     C_STATS = "\033[1;97m"
     C_GREEN = "\033[1;32m"
     
+    phase_icons = {
+        "READ": "📖 READ",
+        "REFLECT": "✍️ REFLECT",
+        "LIMIT_WAIT": "🌙 LIMIT_WAIT",
+        "START": "🚀 START",
+    }
+    phase_str = phase_icons.get(rs.phase, rs.phase)
+
     prog_pct = int((rs.hours_done / rs.hours_total) * 100) if rs.hours_total > 0 else 0
     bar = make_progress_bar(rs.hours_done, rs.hours_total)
     
     return (
-        f"TFC {done_str} · {pos} "
-        f"{C_PHASE}{rs.phase}{C_RESET} "
-        f"{C_TIMER}{timer_str}{C_RESET} · "
-        f"{title} · "
-        f"{C_STATS}today {rs.hours_today:.1f}/{DAILY_HOUR_LIMIT:.0f}h{C_RESET} · "
-        f"{C_GREEN}[{bar}] {prog_pct}%{C_RESET} "
-        f"({rs.hours_done:.1f}/{rs.hours_total:.0f}h) · "
+        f"TFC {done_str:<12} │ {pos:<7} │ "
+        f"{C_PHASE}{phase_str:<15}{C_RESET} │ "
+        f"{C_TIMER}{timer_str:<5}{C_RESET} │ "
+        f"{title:<42} │ "
+        f"{C_STATS}today {rs.hours_today:.1f}/{DAILY_HOUR_LIMIT:.0f}h{C_RESET} │ "
+        f"{C_GREEN}[{bar}] {prog_pct:3}%{C_RESET} "
+        f"({rs.hours_done:.1f}/{rs.hours_total:.0f}h) │ "
         f"left {remaining_today:.1f}h"
     )
 
@@ -1046,7 +1064,8 @@ async def wait_for_daily_reset(page, rs: RunState):
             log.info("🔍 Periodic check: inspecting daily limit status on site...")
             daily = await get_daily_status(page)
             if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
-                log.info(f"🌅 Site daily limit reset detected! ({daily['hours_remaining_today']:.1f}h remaining today)")
+                log_event("daily_limit_reset_detected")
+                log.info("🌅 Limit reset confirmed! Resuming coursework...")
                 break
 
         if secs_remaining <= 0:
@@ -1054,7 +1073,8 @@ async def wait_for_daily_reset(page, rs: RunState):
             await page.wait_for_timeout(5000)
             daily = await get_daily_status(page)
             if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
-                log.info("🌅 Daily limit reset confirmed! Resuming coursework...")
+                log_event("daily_limit_reset_detected")
+                log.info("🌅 Limit reset confirmed! Resuming coursework...")
                 break
             else:
                 log.info("⏳ Midnight reached! Reset not updated on site yet; retrying in 2 minutes...")
