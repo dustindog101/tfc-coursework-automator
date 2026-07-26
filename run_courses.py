@@ -170,6 +170,27 @@ async def get_daily_status(page) -> dict:
     }
 
 
+# ── Caffeinate Manager ────────────────────────────────────────────────────────
+class CaffeinateManager:
+    def __init__(self):
+        self.enabled = os.getenv("ENABLE_CAFFEINATE", "1") == "1" and sys.platform == "darwin"
+        self.proc = None
+
+    def start(self):
+        if self.enabled and (self.proc is None or self.proc.poll() is not None):
+            self.proc = subprocess.Popen(["caffeinate", "-i", "-s"])
+            log.info("☕ Smart Caffeinate Active (Keeping Mac awake during active coursework)")
+
+    def stop(self):
+        if self.enabled and self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait()
+            self.proc = None
+            log.info("🌙 Daily limit reached — Caffeinate released (Mac allowed to sleep until 12:00 AM)")
+
+CAFFEINATE_MANAGER = CaffeinateManager()
+
+
 # ── Run state + live status display ───────────────────────────────────────────
 @dataclass
 class RunState:
@@ -986,6 +1007,8 @@ async def wait_for_daily_reset(page, rs: RunState):
 
     h_str = f"{secs_until_midnight // 3600}h {(secs_until_midnight % 3600) // 60}m {secs_until_midnight % 60}s"
 
+    CAFFEINATE_MANAGER.stop()
+
     log.info("╭────────────────────────────────────────────────────────╮")
     log.info("│ ⛔ DAILY LIMIT REACHED ON PLATFORM (8.0h / 8.0h max)   │")
     log.info("├────────────────────────────────────────────────────────┤")
@@ -1165,8 +1188,11 @@ async def main():
         if check_daily_limit(hours_today, hours_remaining_today):
             await wait_for_daily_reset(page, rs)
 
+        CAFFEINATE_MANAGER.start()
+
         if prog["remaining"] <= 0:
             log.info("🎉 All hours complete!")
+            CAFFEINATE_MANAGER.stop()
             await page.close()
             await ctx.close()
             await browser.close()
@@ -1184,6 +1210,7 @@ async def main():
 
             if check_daily_limit(hours_today, hours_remaining_today):
                 await wait_for_daily_reset(page, rs)
+                CAFFEINATE_MANAGER.start()
                 continue
 
             lessons, cta_url = await fetch_coursework_catalog(page)
@@ -1273,6 +1300,7 @@ async def main():
         log_event("bot_stop", lessons_this_run=session_done,
                   hours_done=prog["done"], hours_today=hours_today)
         set_terminal_title(f"TFC stopped · session {session_done} done · {prog['done']:.1f}/{prog['total']:.0f}h")
+        CAFFEINATE_MANAGER.stop()
         await page.close()
         await ctx.close()
         await browser.close()
