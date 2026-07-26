@@ -1306,10 +1306,27 @@ def log_user_profile(user_info: dict, prog: dict):
     log_event("user_profile_loaded", **user_info)
 
 
+async def check_site_reset_with_reauth(page) -> dict:
+    """
+    Check site daily limit status. If session expired or cookie cleared,
+    automatically triggers fallback re-login via ensure_auth.
+    """
+    daily = await get_daily_status(page)
+    if daily.get("source") != "site":
+        log.warning("🔑 Site status check lost session / logged out — executing fallback re-login...")
+        if await ensure_auth(page):
+            daily = await get_daily_status(page)
+    return daily
+
+
 async def wait_for_daily_reset(page, rs: RunState):
     """
     Called when daily limit (8.0h) is reached.
-    Notifies the user and waits until midnight local time (00:00:00) or until site limit resets.
+    Notifies the user and rests until:
+      1. 5 minutes before midnight (11:55 PM) - Early reset check
+      2. At Midnight (12:00 AM) - Midnight reset check
+      3. Every 15 minutes after midnight (12:15 AM, 12:30 AM...) - Retries until site updates
+    Uses automatic re-login as a fallback if cookies/session cleared.
     """
     now = datetime.now()
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1324,17 +1341,19 @@ async def wait_for_daily_reset(page, rs: RunState):
     log.info("├────────────────────────────────────────────────────────┤")
     log.info(f"│ 📅 Today's Logged Hours: {rs.hours_today:.1f}h")
     log.info(f"│ 📊 Overall Progress: {rs.hours_done:.1f}h / {rs.hours_total:.1f}h total")
-    log.info("│ 🔔 USER NOTIFICATION: Limit reached. Bot will wait...  │")
-    log.info(f"│ ⏰ Next reset estimated at: {tomorrow.strftime('%Y-%m-%d 12:00:00 AM')}")
+    log.info("│ 🔔 USER NOTIFICATION: Limit reached. Bot resting...    │")
+    log.info(f"│ ⏰ Target Midnight Reset: {tomorrow.strftime('%Y-%m-%d 12:00:00 AM')}")
+    log.info("│ 🕒 Scheduled Checks: 11:55 PM | 12:00 AM | Every 15m post │")
     log.info(f"│ ⏳ Time until reset: {h_str}")
     log.info("╰────────────────────────────────────────────────────────╯")
 
     log_event("daily_limit_wait_start", seconds_until_midnight=secs_until_midnight, reset_target=tomorrow.isoformat())
 
     start_time = time.time()
-    last_check_time = time.time()
     last_notify_time = 0.0
     last_scroll_time = time.time()
+
+    pre_midnight_checked = False
 
     while True:
         now = datetime.now()
@@ -1349,20 +1368,48 @@ async def wait_for_daily_reset(page, rs: RunState):
             last_notify_time = time.time()
             rem_h = secs_remaining // 3600
             rem_m = (secs_remaining % 3600) // 60
-            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (12:00 AM local time). Resting...")
+            log.info(f"🌙 [LIMIT_WAIT] ⏱ {rem_h:02d}h {rem_m:02d}m remaining until daily reset (12:00 AM). Resting...")
 
+        # ── 1. Check 5 minutes before midnight (11:55 PM) ────────────────────
+        if secs_remaining <= 300 and not pre_midnight_checked:
+            pre_midnight_checked = True
+            log.info("⏰ 5 minutes before midnight (11:55 PM) — inspecting site for early reset...")
+            daily = await check_site_reset_with_reauth(page)
+            if daily.get("hours_remaining_today", 0) > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
+                log_event("daily_limit_reset_detected", timing="pre_midnight")
+                log.info("🌅 Early limit reset confirmed (11:55 PM)! Resuming coursework...")
+                break
+
+        # ── 2. Check at Midnight (12:00 AM) & every 15 minutes after ──────────
         if secs_remaining <= 0:
-            log.info("🌅 Local midnight reached! Checking daily limit status on site...")
-            await page.wait_for_timeout(5000)
-            daily = await get_daily_status(page)
-            if daily["hours_remaining_today"] > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
-                log_event("daily_limit_reset_detected")
-                log.info("🌅 Limit reset confirmed! Resuming coursework...")
+            log.info("🌅 Local midnight reached (12:00 AM)! Checking daily limit status on site...")
+            await page.wait_for_timeout(3000)
+            daily = await check_site_reset_with_reauth(page)
+
+            if daily.get("hours_remaining_today", 0) > 0 and not daily.get("site_limit_reached") and daily.get("source") == "site":
+                log_event("daily_limit_reset_detected", timing="midnight")
+                log.info("🌅 Limit reset confirmed at 12:00 AM! Resuming coursework...")
                 break
             else:
-                log.info("⏳ Midnight reached! Reset not updated on site yet; retrying in 2 minutes...")
-                await page.wait_for_timeout(120000)
+                log.info("⏳ Midnight reached, but site hasn't updated yet. Checking every 15 minutes (12:15 AM, 12:30 AM...)...")
+                # Wait 15 minutes (900 seconds) between post-midnight re-checks
+                for _ in range(36): # 36 x 25s = 900s (15 min)
+                    now_post = datetime.now()
+                    live_status(
+                        "LIMIT_WAIT", 0, "Midnight Passed - Retrying every 15m",
+                        rs.hours_done, rs.hours_today, rs.hours_total, rs
+                    )
+                    await page.wait_for_timeout(25000)
 
+                log.info("🔍 15-minute post-midnight check: inspecting daily limit status on site...")
+                daily_retry = await check_site_reset_with_reauth(page)
+                if daily_retry.get("hours_remaining_today", 0) > 0 and not daily_retry.get("site_limit_reached") and daily_retry.get("source") == "site":
+                    log_event("daily_limit_reset_detected", timing="post_midnight_15m")
+                    log.info("🌅 Limit reset confirmed post-midnight! Resuming coursework...")
+                    break
+                continue
+
+        # In-page micro-scroll keep-alive every 5 minutes
         if time.time() - last_scroll_time >= 300:
             last_scroll_time = time.time()
             try:
