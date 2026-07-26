@@ -867,7 +867,12 @@ async def get_user_profile(page) -> dict:
             href = await proof_link.first.get_attribute("href") or ""
             m_id = re.search(r"/enrollment-proof/([^/]+)", href)
             if m_id:
-                info["ENROLLMENT PROOF ID"] = m_id.group(1)
+                enrollment_id = m_id.group(1)
+                info["ENROLLMENT PROOF ID"] = enrollment_id
+                info["OFFICIAL ENROLLMENT PROOF PDF URL"] = f"https://www.thefoundationofchange.org/api/enrollment-proof/{enrollment_id}/pdf"
+
+        info["COURT AUTHORIZATION LETTER LINK"] = "https://www.thefoundationofchange.org/letter-of-introductions"
+        info["CERTIFICATE VERIFICATION PORTAL LINK"] = "https://www.thefoundationofchange.org/certificate-verification"
 
         # Go to Edit Profile page (/dashboard/profile)
         await safe_goto(page, f"{BASE_URL}/dashboard/profile")
@@ -922,6 +927,9 @@ def log_user_profile(user_info: dict, prog: dict):
         "ADDRESS", "CITY", "STATE", "ZIP CODE",
         "PROBATION OFFICER", "COURT ID",
         "ENROLLMENT PROOF ID", "Enrollment Proof ID",
+        "OFFICIAL ENROLLMENT PROOF PDF URL",
+        "COURT AUTHORIZATION LETTER LINK",
+        "CERTIFICATE VERIFICATION PORTAL LINK",
     ]
 
     logged_keys = set()
