@@ -451,27 +451,23 @@ def log_reflection_generated(
     )
 
 
-_SOURCE_PRIORITY = {"agy": 3, "opencode": 2, "fallback": 1, "": 0}
+def needs_llm_recheck(reflection: str, source: str) -> bool:
+    """Only retry LLM when we lack a real agy/opencode draft."""
+    return not (reflection and reflection.strip()) or source in ("", "fallback")
 
 
-def refresh_reflection_before_submit(
+def try_upgrade_reflection(
     art_title: str, art_body: str, lesson_prompt: str,
     current: str, current_source: str,
 ) -> tuple[str, str]:
-    """Last-chance agy/opencode retry right before submit (quota may have reopened)."""
-    log.info("   Pre-submit LLM recheck (agy/opencode may have reopened)...")
+    """Last-chance agy/opencode retry before submit (quota may have reopened)."""
+    log.info("   Pre-submit LLM retry (no agy/opencode draft yet)...")
     new_text, new_source = call_agy(art_title, art_body, lesson_prompt)
-    if _SOURCE_PRIORITY.get(new_source, 0) > _SOURCE_PRIORITY.get(current_source, 0):
-        log.info(
-            f"   Pre-submit upgrade: {current_source or 'none'} -> {new_source} "
-            f"({len(new_text)} chars)"
-        )
+    if new_source in ("agy", "opencode"):
+        log.info(f"   Pre-submit got {new_source} ({len(new_text)} chars)")
         return new_text, new_source
-    if current_source in ("agy", "opencode"):
-        log.info(f"   Pre-submit recheck unavailable — keeping {current_source} draft")
-        return current, current_source
-    log.info("   Pre-submit recheck still fallback only — keeping current draft")
-    return current, current_source
+    log.info("   Pre-submit retry still fallback — keeping current draft")
+    return current or new_text, current_source or new_source
 
 
 async def fill_reflection_textarea(page, reflection: str) -> int:
@@ -709,77 +705,129 @@ def _match_url_for_title(title: str, url_map: dict[str, str]) -> Optional[str]:
 
 
 async def fetch_coursework_catalog(page) -> tuple[list[LessonEntry], Optional[str]]:
-    """Scrape /coursework for lesson statuses and build an ordered catalog."""
+    """Scrape /coursework for lesson statuses and build an ordered catalog using robust DOM evaluation."""
     if not await safe_goto(page, f"{BASE_URL}/coursework"):
         log.error("Failed to load coursework page")
         return [], None
 
     await page.wait_for_timeout(3000)
-    body = await page.inner_text("body")
 
-    lessons: list[LessonEntry] = []
-    for m in LESSON_ROW_RE.finditer(body):
-        lessons.append(LessonEntry(
-            title=m.group(1).strip(),
-            duration=m.group(2).strip(),
-            status=m.group(3).lower(),
-        ))
+    # Robust Playwright JS evaluation querying lesson row containers directly from the DOM on /coursework
+    catalog_data = await page.evaluate("""() => {
+        const rows = [];
+        const seenTitles = new Set();
+        const ignoreRegex = /Need help\\?|RECOMMENDED FOR YOU|Your Coursework|Overall Progress|Hours Remaining|Today's Limit|Dashboard|Back to Dashboard/i;
 
-    link_rows = await page.evaluate("""() => {
-      const out = [];
-      const seen = new Set();
-      for (const a of document.querySelectorAll('a[href*="/coursework/"]')) {
-        const m = a.href.match(/\\/coursework\\/([a-f0-9-]{36})$/);
-        if (!m || seen.has(a.href)) continue;
-        const linkText = (a.innerText || '').trim();
-        if (/Continue Coursework/i.test(linkText)) continue;
-        seen.add(a.href);
+        const candidates = Array.from(document.querySelectorAll('div, li'));
 
-        let rowText = '';
-        let el = a.parentElement;
-        for (let i = 0; i < 3; i++) {
-          if (!el) break;
-          const t = (el.innerText || '').trim();
-          if (t.length > 8 && t.length < 220 && /\\d+\\s*min/i.test(t)) {
-            rowText = t;
-            break;
-          }
-          el = el.parentElement;
+        for (const el of candidates) {
+            const text = (el.innerText || '').trim();
+            if (!text || text.length > 350) continue;
+            if (ignoreRegex.test(text)) continue;
+
+            const durMatch = text.match(/(\\d+\\s*min)/i);
+            if (!durMatch) continue;
+
+            let status = null;
+            if (/\\bDone\\b/i.test(text)) status = 'done';
+            else if (/\\bContinue\\b/i.test(text)) status = 'continue';
+            else if (/\\bStart\\b/i.test(text)) status = 'start';
+            if (!status) continue;
+
+            const childMatches = Array.from(el.querySelectorAll('div, li')).some(child => {
+                if (child === el) return false;
+                const ct = (child.innerText || '').trim();
+                return ct.length < 350 && /(\\d+\\s*min)/i.test(ct) && /\\b(Done|Continue|Start)\\b/i.test(ct);
+            });
+            if (childMatches) continue;
+
+            const duration = durMatch[1].trim();
+
+            const linkEl = el.querySelector('a[href*="/coursework/"]');
+            let href = null;
+            if (linkEl) {
+                const h = linkEl.getAttribute('href');
+                if (h) {
+                    href = h.startsWith('/') ? window.location.origin + h : h;
+                }
+            }
+
+            const lines = text.split('\\n').map(s => s.trim()).filter(Boolean);
+            let rawTitle = '';
+            for (const line of lines) {
+                if (/^(✅|📖|○|Done|Continue|Start)$/i.test(line)) continue;
+                if (/^\\d+\\s*min$/i.test(line)) continue;
+                if (line.length > 3) {
+                    rawTitle = line.replace(/\\s*\\d+\\s*min\\s*$/i, '').trim();
+                    break;
+                }
+            }
+
+            if (!rawTitle || rawTitle.length < 3) continue;
+
+            let title = rawTitle
+                .replace(/^(✅|📖|○)\\s*/, '')
+                .replace(/\\s*(Done|Continue|Start)$/i, '')
+                .replace(/\\s*\\d+\\s*min$/, '')
+                .trim();
+
+            if (ignoreRegex.test(title)) continue;
+
+            const normKey = title.toLowerCase();
+            if (!seenTitles.has(normKey)) {
+                seenTitles.add(normKey);
+                rows.push({
+                    title: title,
+                    duration: duration,
+                    status: status,
+                    url: href
+                });
+            }
         }
-        if (!rowText) continue;
 
-        const lines = rowText.split('\\n').map(s => s.trim()).filter(Boolean);
-        let title = '';
-        for (const line of lines) {
-          if (/^(✅|📖|○|Done|Continue|Start)$/i.test(line)) continue;
-          if (/^\\d+\\s*min$/i.test(line)) continue;
-          title = line.replace(/\\s*\\d+\\s*min\\s*$/i, '').trim();
-          if (title.length > 5) break;
+        let ctaUrl = null;
+        for (const a of document.querySelectorAll('a[href*="/coursework/"]')) {
+            if (/Continue Coursework/i.test(a.innerText || '')) {
+                const h = a.getAttribute('href');
+                if (h) {
+                    ctaUrl = h.startsWith('/') ? window.location.origin + h : h;
+                    break;
+                }
+            }
         }
-        if (!title) continue;
-        out.push({title, href: a.href, linkText});
-      }
-      return out;
+
+        return { rows, ctaUrl };
     }""")
 
-    url_map = {_normalize_title(r["title"]): r["href"] for r in link_rows}
-    for lesson in lessons:
-        lesson.url = _match_url_for_title(lesson.title, url_map)
+    rows_raw = catalog_data.get("rows", [])
+    cta_url = catalog_data.get("ctaUrl")
 
-    cta_url = None
-    try:
-        cta = page.locator("a:has-text('Continue Coursework')").first
-        if await cta.count() > 0:
-            href = await cta.get_attribute("href")
-            if href:
-                if href.startswith("/"):
-                    href = BASE_URL + href
-                if UUID_RE.search(href):
-                    cta_url = href
-    except Exception:
-        pass
+    # If CTA button wasn't found by text, try Playwright locator fallback
+    if not cta_url:
+        try:
+            cta = page.locator("a:has-text('Continue Coursework')").first
+            if await cta.count() > 0:
+                href = await cta.get_attribute("href")
+                if href:
+                    if href.startswith("/"):
+                        href = BASE_URL + href
+                    if UUID_RE.search(href):
+                        cta_url = href
+        except Exception:
+            pass
 
-    # Fallback: attach CTA URL to the Continue lesson from text catalog
+    # Build LessonEntry objects
+    lessons: list[LessonEntry] = []
+    for r in rows_raw:
+        entry = LessonEntry(
+            title=r["title"],
+            duration=r["duration"],
+            status=r["status"],
+            url=r["url"],
+        )
+        lessons.append(entry)
+
+    # Attach CTA URL to the Continue lesson if URL wasn't directly in the row
     if cta_url:
         for lesson in lessons:
             if lesson.status == "continue" and not lesson.url:
@@ -789,26 +837,50 @@ async def fetch_coursework_catalog(page) -> tuple[list[LessonEntry], Optional[st
     done = sum(1 for l in lessons if l.status == "done")
     cont = sum(1 for l in lessons if l.status == "continue")
     start = sum(1 for l in lessons if l.status == "start")
-    log.info(f"Catalog: {len(lessons)} lessons ({done} done, {cont} continue, {start} start)")
+    log.info(f"Catalog: {len(lessons)} lessons extracted ({done} done, {cont} continue, {start} start)")
     if cta_url:
         log.info(f"   CTA continue: {cta_url}")
 
+    # ── Update completed_courses.json ──────────────────────────────────────────
     completed_titles = [l.title for l in lessons if l.status == "done"]
+    
+    existing_completed = []
+    if os.path.exists(COMPLETED_COURSES_FILE):
+        try:
+            with open(COMPLETED_COURSES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    existing_completed = data.get("courses", [])
+                elif isinstance(data, list):
+                    existing_completed = data
+        except Exception as e:
+            log.warning(f"Could not read existing completed_courses.json: {e}")
+
+    merged_titles = list(existing_completed)
+    for t in completed_titles:
+        if t not in merged_titles:
+            merged_titles.append(t)
+
     try:
-        with open(os.path.join(ROOT_DIR, "completed_courses.json"), "w", encoding="utf-8") as f:
-            json.dump({"count": len(completed_titles), "courses": completed_titles, "updated": datetime.now().isoformat()}, f, indent=2)
+        with open(COMPLETED_COURSES_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "count": len(merged_titles),
+                "courses": merged_titles,
+                "updated": datetime.now().isoformat()
+            }, f, indent=2)
         log.info("╭────────────────────────────────────────────────────────╮")
-        log.info("│ 🎓 COMPLETED COURSES LIST                              │")
+        log.info(f"│ 🎓 COMPLETED COURSES LIST ({len(merged_titles):<27}) │")
         log.info("├────────────────────────────────────────────────────────┤")
-        for i, title in enumerate(completed_titles, 1):
-            log.info(f"│ {i}. {title}")
+        for i, title in enumerate(merged_titles, 1):
+            log.info(f"│ {i:2d}. {title}")
         log.info("╰────────────────────────────────────────────────────────╯")
     except Exception as e:
         log.error(f"Failed to save completed courses: {e}")
-    log_event("completed_courses_snapshot", count=len(completed_titles), courses=completed_titles)
 
+    log_event("completed_courses_snapshot", count=len(merged_titles), courses=merged_titles)
     log_event("catalog_snapshot", total=len(lessons), done=done,
               continue_count=cont, start=start, cta_url=cta_url)
+
     return lessons, cta_url
 
 
@@ -872,18 +944,18 @@ async def inspect_lesson(page, lesson: LessonEntry) -> str:
 
     reflect_url = lesson.url.rstrip("/") + "/reflect"
 
-    # Unstarted lessons: verify reading before reflect
-    if lesson.status == "start":
-        if await safe_goto(page, lesson.url):
-            secs = await get_timer(page)
-            body = await page.inner_text("body")
-            if secs > 0:
-                log.info(f"   → Needs reading ({secs//60}:{secs%60:02d}): {lesson.title!r}")
-                return "needs_read"
-            if "Time Remaining" in body and "REFLECTION FOR" not in body:
-                log.info(f"   → Needs reading (timer on page): {lesson.title!r}")
-                return "needs_read"
+    # Step 1: Check reading URL first (resilient detection of active reading timer)
+    if await safe_goto(page, lesson.url):
+        secs = await get_timer(page)
+        body = await page.inner_text("body")
+        if secs > 0:
+            log.info(f"   → Needs reading (timer active {secs//60}:{secs%60:02d}): {lesson.title!r}")
+            return "needs_read"
+        if "Time Remaining" in body and "REFLECTION FOR" not in body:
+            log.info(f"   → Needs reading (timer on page): {lesson.title!r}")
+            return "needs_read"
 
+    # Step 2: Check reflect URL (resilient detection of submitted or active reflection timer)
     if await safe_goto(page, reflect_url):
         body = await page.inner_text("body")
         if any(kw in body for kw in ["Reflection Submitted", "Next Article", "Great work"]):
@@ -892,27 +964,18 @@ async def inspect_lesson(page, lesson: LessonEntry) -> str:
         if await page_has_reflect_form(page):
             log.info(f"   → Needs reflect: {lesson.title!r}")
             return "needs_reflect"
-
-    if lesson.status == "continue":
-        if await safe_goto(page, lesson.url):
-            secs = await get_timer(page)
-            if secs > 0:
-                log.info(f"   → Continue: reading timer still active: {lesson.title!r}")
-                return "needs_read"
-
-    if await safe_goto(page, lesson.url):
         secs = await get_timer(page)
         if secs > 0:
-            log.info(f"   → Needs reading ({secs//60}:{secs%60:02d}): {lesson.title!r}")
-            return "needs_read"
-
-    if await safe_goto(page, reflect_url):
-        if await page_has_reflect_form(page):
-            log.info(f"   → Reading done, needs reflect: {lesson.title!r}")
+            log.info(f"   → Needs reflect (timer active {secs//60}:{secs%60:02d}): {lesson.title!r}")
             return "needs_reflect"
-        body = await page.inner_text("body")
-        if any(kw in body for kw in ["Reflection Submitted", "Next Article", "Great work"]):
-            return "complete"
+
+    if lesson.status == "continue":
+        log.info(f"   → Status is continue — treating as needs_read: {lesson.title!r}")
+        return "needs_read"
+
+    if lesson.status == "start":
+        log.info(f"   → Status is start — treating as needs_read: {lesson.title!r}")
+        return "needs_read"
 
     log.warning(f"   Could not determine state for {lesson.title!r} — skipping")
     return "complete"
@@ -1057,15 +1120,18 @@ async def reflect_phase(
         log.info(f"   Reflect timer: {secs//60}:{secs%60:02d}")
         await wait_for_timer(page, "REFLECT", art_title, hours_done, hours_today, hours_total, rs)
 
-    loop = asyncio.get_event_loop()
-    refreshed, refreshed_source = await loop.run_in_executor(
-        None, refresh_reflection_before_submit,
-        art_title, art_body, lesson_prompt, reflection, reflection_source,
-    )
-    if (refreshed, refreshed_source) != (reflection, reflection_source):
-        reflection, reflection_source = refreshed, refreshed_source
-        log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
-        filled_len = await fill_reflection_textarea(page, reflection)
+    if needs_llm_recheck(reflection, reflection_source):
+        loop = asyncio.get_event_loop()
+        upgraded, upgraded_source = await loop.run_in_executor(
+            None, try_upgrade_reflection,
+            art_title, art_body, lesson_prompt, reflection, reflection_source,
+        )
+        if upgraded_source in ("agy", "opencode"):
+            reflection, reflection_source = upgraded, upgraded_source
+            log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
+            filled_len = await fill_reflection_textarea(page, reflection)
+    else:
+        log.info(f"   Pre-submit skip — already have {reflection_source} draft")
 
     submit_sel = "button:has-text('Submit Reflection'), button.btn-cta[type='submit']"
     for attempt in range(20):
