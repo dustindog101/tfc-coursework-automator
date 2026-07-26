@@ -171,6 +171,12 @@ class TFCCourseworkMenuApp(rumps.App):
         # Check start on login state
         self.sync_autostart_ui()
 
+        # Initial state update (instant UI populate)
+        try:
+            self.update_state(None)
+        except Exception:
+            pass
+
         # Auto-launch bot process in Headless mode by default
         self.ensure_bot_running_on_start()
 
@@ -394,6 +400,14 @@ class TFCCourseworkMenuApp(rumps.App):
         if os.path.exists(LOG_FILE):
             subprocess.run(["open", LOG_FILE])
 
+    def safe_clear_menu(self, menu_item):
+        """Safely remove all sub-items from a rumps MenuItem without rumps _menu NSMenu crashes."""
+        try:
+            for k in list(menu_item.keys()):
+                del menu_item[k]
+        except Exception:
+            pass
+
     @rumps.timer(1)
     def update_state(self, _):
         """Polled every 1 second: monitors runner, watchdog, events.jsonl & automation.log."""
@@ -519,7 +533,7 @@ class TFCCourseworkMenuApp(rumps.App):
                     history_items.append(f"{t_prefix}🚀 Bot Engine Started")
                     
             if history_items:
-                self.menu_history.clear()
+                self.safe_clear_menu(self.menu_history)
                 for h in history_items:
                     self.menu_history.add(rumps.MenuItem(h))
                     
@@ -538,10 +552,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 pass
                 
         self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_count})"
-        try:
-            self.menu_bot_completed.clear()
-        except Exception:
-            pass
+        self.safe_clear_menu(self.menu_bot_completed)
             
         if bot_count > 0:
             self.menu_bot_completed.add(rumps.MenuItem(f"✅ Finished by Bot: {bot_count}"))
@@ -572,10 +583,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 pass
                 
         self.menu_site_completed.title = f"🌐 All Site Completed Courses ({all_count})"
-        try:
-            self.menu_site_completed.clear()
-        except Exception:
-            pass
+        self.safe_clear_menu(self.menu_site_completed)
             
         if all_count > 0:
             done_f = float(self.progress.get("done", 0.0))
