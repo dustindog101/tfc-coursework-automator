@@ -302,10 +302,78 @@ def _strip_em_dash(t: str) -> str:
     return t.replace("\u2014", ",").replace("\u2013", ",").replace("—", ",").replace("–", ",")
 
 
+def _run_llm_prompt(system_prompt: str) -> Optional[str]:
+    """
+    Try agy first, then opencode, then return None.
+    Returns clean reflection text or None on all failures.
+    """
+    # ── 1. Try agy ────────────────────────────────────────────────────────────
+    try:
+        result = subprocess.run(
+            ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)"],
+            capture_output=True, text=True, timeout=60, cwd=ROOT_DIR,
+        )
+        if result.returncode == 0:
+            text = result.stdout.strip().strip('"\'')
+            text = _strip_em_dash(text)
+            text = re.sub(r'^```.*?\n', '', text, flags=re.MULTILINE).strip()
+            if len(text) >= REFLECTION_MIN:
+                log.info(f"agy reflection ({len(text)} chars): {text!r}")
+                return text
+            else:
+                log.warning(f"agy output too short ({len(text)} chars): {text!r}")
+        else:
+            stderr = result.stderr[:300]
+            if any(k in stderr.lower() for k in ["quota", "rate", "limit", "429", "exhausted"]):
+                log.warning(f"agy quota/rate limit hit — trying opencode fallback")
+            else:
+                log.warning(f"agy exit {result.returncode}: {stderr}")
+    except subprocess.TimeoutExpired:
+        log.warning("agy timed out (60s) — trying opencode fallback")
+    except FileNotFoundError:
+        log.warning("agy not found in PATH — trying opencode fallback")
+    except Exception as e:
+        log.warning(f"agy error: {e} — trying opencode fallback")
+
+    # ── 2. Try opencode ───────────────────────────────────────────────────────
+    try:
+        result = subprocess.run(
+            ["opencode", "run", system_prompt],
+            capture_output=True, text=True, timeout=90, cwd=ROOT_DIR,
+        )
+        if result.returncode == 0:
+            # opencode outputs the raw response text on stdout
+            text = result.stdout.strip().strip('"\'')
+            text = _strip_em_dash(text)
+            text = re.sub(r'^```.*?\n', '', text, flags=re.MULTILINE).strip()
+            # opencode may include session headers — take last paragraph only
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            # Find the longest line that looks like actual prose
+            prose = next(
+                (l for l in reversed(lines) if len(l) >= REFLECTION_MIN and not l.startswith("{") and not l.startswith("timestamp")),
+                text
+            )
+            prose = prose[:REFLECTION_MAX]
+            if len(prose) >= REFLECTION_MIN:
+                log.info(f"opencode reflection ({len(prose)} chars): {prose!r}")
+                return prose
+            else:
+                log.warning(f"opencode output too short ({len(prose)} chars)")
+        else:
+            log.warning(f"opencode exit {result.returncode}: {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        log.warning("opencode timed out (90s)")
+    except FileNotFoundError:
+        log.warning("opencode not found in PATH")
+    except Exception as e:
+        log.warning(f"opencode error: {e}")
+
+    return None
+
+
 def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
     """
-    Call `agy -p` with the article content piped in to get a reflection.
-    Falls back to rotating hardcoded reflections if agy fails.
+    Generate a reflection via agy → opencode → hardcoded fallback chain.
     """
     system_prompt = (
         "- Include multiple natural typing and writing errors: missing apostrophes (e.g. 'dont', 'im', 'cant'), minor casual typos, lowercased sentence start, informal phrasing, missing commas.\n"
@@ -318,41 +386,17 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
         f"Reflection Prompt Question: {prompt_text}\n\n"
     )
 
-    try:
-        result = subprocess.run(
-            ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=ROOT_DIR,
-        )
-        if result.returncode == 0:
-            text = result.stdout.strip().strip('"\'')
-            text = _strip_em_dash(text)
-            # Strip any leading/trailing markdown if agy wraps it
-            text = re.sub(r'^```.*?\n', '', text, flags=re.MULTILINE)
-            text = text.strip()
-            if len(text) > REFLECTION_MAX:
-                cut = text.rfind(".", REFLECTION_MIN, REFLECTION_MAX)
-                text = text[:cut + 1] if cut > REFLECTION_MIN else text[:REFLECTION_MAX]
-            if len(text) >= REFLECTION_MIN:
-                log.info(f"agy reflection ({len(text)} chars): {text!r}")
-                return text
-            else:
-                log.warning(f"agy output too short ({len(text)} chars): {text!r}")
-        else:
-            log.warning(f"agy exit {result.returncode}: {result.stderr[:200]}")
-    except subprocess.TimeoutExpired:
-        log.warning("agy timed out (60s)")
-    except FileNotFoundError:
-        log.warning("agy not found in PATH")
-    except Exception as e:
-        log.warning(f"agy error: {e}")
+    result = _run_llm_prompt(system_prompt)
+    if result:
+        if len(result) > REFLECTION_MAX:
+            cut = result.rfind(".", REFLECTION_MIN, REFLECTION_MAX)
+            result = result[:cut + 1] if cut > REFLECTION_MIN else result[:REFLECTION_MAX]
+        return result
 
-    # Fallback
+    # ── 3. Hardcoded fallback ─────────────────────────────────────────────────
     idx = int(time.time() / 3600) % len(_FALLBACKS)
     r = _FALLBACKS[idx]
-    log.info(f"Fallback reflection [{idx}] ({len(r)} chars)")
+    log.warning(f"Both agy and opencode failed — using hardcoded fallback [{idx}] ({len(r)} chars)")
     return r
 
 
@@ -441,55 +485,81 @@ async def extract_article(page) -> tuple[str, str]:
     title = "Community Service Article"
     body  = "community service, personal growth, and community impact"
     try:
-        for sel in ["h1", "h2", ".article-title", ".title"]:
-            el = page.locator(sel).first
-            if await el.count() > 0:
-                t = (await el.inner_text()).strip()
-                if 5 < len(t) < 200 and "Foundation" not in t:
-                    title = t
-                    break
-                    
+        # ── Title: try multiple selectors in priority order ───────────────────
+        title_selectors = [
+            "h1", ".article-title", ".lesson-title", ".course-title",
+            "[class*='title']", "[class*='heading']", "h2"
+        ]
+        for sel in title_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.count() > 0:
+                    t = (await el.inner_text()).strip()
+                    if 5 < len(t) < 200 and "Foundation" not in t and "Log" not in t:
+                        title = t
+                        break
+            except Exception:
+                continue
+
+        # ── Body: JS evaluation with resilient multi-strategy extraction ──────
         extracted_body = await page.evaluate('''() => {
-            let container = document.querySelector('article') || 
-                            document.querySelector('main') || 
-                            document.querySelector('.prose') || 
-                            document.querySelector('#content');
-            
+            const CLUTTER_WORDS = [
+                "time remaining", "navigation", "dashboard", "log out", "logout",
+                "reflection submitted", "submit", "next article", "great work",
+                "sign in", "sign out", "copyright", "all rights reserved",
+                "cookie", "privacy policy", "terms of service"
+            ];
+            const CLUTTER_TAGS = new Set(["button", "nav", "footer", "header", "script", "style", "noscript"]);
+            const MIN_PARA_LEN = 40;
+
+            function isClutter(el, text) {
+                if (CLUTTER_TAGS.has(el.tagName.toLowerCase())) return true;
+                if (el.closest("nav, footer, header, [role='navigation']")) return true;
+                const lower = text.toLowerCase();
+                for (let w of CLUTTER_WORDS) {
+                    if (lower.includes(w)) return true;
+                }
+                return false;
+            }
+
+            // Strategy 1: explicit article/main/prose containers
+            const CONTAINER_SELS = [
+                "article", "main", ".prose", ".article-body", ".lesson-content",
+                ".course-content", "#content", "[class*='content']", "[class*='article']",
+                "[class*='lesson']", "[class*='course']"
+            ];
+            let container = null;
+            for (let sel of CONTAINER_SELS) {
+                const el = document.querySelector(sel);
+                if (el) { container = el; break; }
+            }
+
             let elements = [];
             if (container) {
-                elements = Array.from(container.querySelectorAll('p, h2, h3, li'));
-                if (elements.length === 0) {
-                    elements = [container];
-                }
-            } else {
-                elements = Array.from(document.querySelectorAll('p'));
+                elements = Array.from(container.querySelectorAll('p, h2, h3, h4, li'));
+                if (elements.length === 0) elements = [container];
             }
-            
-            const clutter = ["Time Remaining", "Navigation", "Dashboard", "Log Out", "Reflection Submitted", "Submit"];
-            let texts = [];
+
+            // Strategy 2: fall back to all paragraphs on page
+            if (elements.length === 0) {
+                elements = Array.from(document.querySelectorAll('p, li'));
+            }
+
+            const seen = new Set();
+            const texts = [];
             for (let el of elements) {
-                let text = (el.innerText || "").trim();
-                if (!text) continue;
-                
-                let isClutter = false;
-                if (text.length < 50) {
-                    for (let c of clutter) {
-                        if (text.toLowerCase().includes(c.toLowerCase())) {
-                            isClutter = true;
-                            break;
-                        }
-                    }
-                    if (el.tagName.toLowerCase() === 'button') isClutter = true;
-                }
-                
-                if (!isClutter) {
-                    texts.push(text);
-                }
+                const text = (el.innerText || "").trim();
+                if (!text || text.length < MIN_PARA_LEN) continue;
+                if (seen.has(text)) continue;
+                if (isClutter(el, text)) continue;
+                seen.add(text);
+                texts.push(text);
+                if (texts.join("\\n\\n").length > 3500) break;
             }
-            return texts.join('\\n\\n');
+            return texts.join("\\n\\n");
         }''')
-        
-        if extracted_body:
+
+        if extracted_body and len(extracted_body.strip()) > 80:
             body = extracted_body[:3000]
         else:
             body = ""
@@ -847,39 +917,81 @@ async def reflect_phase(
     prompt_text = ""
     try:
         prompt_text = await page.evaluate('''() => {
-            const sels = ['label[for]', 'h2', 'h3', 'p', '.reflection-question'];
-            for (let sel of sels) {
-                const els = Array.from(document.querySelectorAll(sel));
-                for (let el of els) {
-                    const text = (el.innerText || "").trim();
-                    if (text.toLowerCase().includes("reflect") || text.toLowerCase().includes("?") || text.toLowerCase().includes("take away")) {
-                        return text;
+            const GENERIC_LABELS = new Set([
+                "your reflection", "your reflection *", "reflection", "reflection *",
+                "reflection question", "reflection submitted", "submit reflection",
+                "time remaining", "required", "enter your response",
+                "write your reflection", "type your reflection here"
+            ]);
+
+            function isGoodPrompt(text) {
+                if (!text || text.trim().length < 15) return false;
+                const lower = text.trim().toLowerCase();
+                if (GENERIC_LABELS.has(lower)) return false;
+                // Must look like an actual question or instruction
+                return (
+                    text.includes("?") ||
+                    lower.startsWith("describe") ||
+                    lower.startsWith("explain") ||
+                    lower.startsWith("how") ||
+                    lower.startsWith("what") ||
+                    lower.startsWith("why") ||
+                    lower.startsWith("reflect") ||
+                    lower.startsWith("think about") ||
+                    lower.startsWith("share") ||
+                    lower.startsWith("discuss")
+                );
+            }
+
+            // Strategy 1: walk up from textarea to find nearby heading/label
+            const ta = document.querySelector("textarea, [contenteditable='true']");
+            if (ta) {
+                let node = ta.parentElement;
+                for (let i = 0; i < 6 && node; i++) {
+                    for (let sel of ["h1", "h2", "h3", "h4", "p.prompt", "p.question", ".prompt", ".question", "label"]) {
+                        const el = node.querySelector(sel);
+                        if (el) {
+                            const t = (el.innerText || "").trim();
+                            if (isGoodPrompt(t)) return t;
+                        }
                     }
+                    node = node.parentElement;
                 }
             }
-            const ta = document.querySelector('textarea');
-            if (ta && ta.placeholder) {
-                return ta.placeholder;
+
+            // Strategy 2: scan known semantic selectors
+            const PROMPT_SELS = [
+                ".reflection-prompt", ".reflection-question", ".prompt",
+                ".question", "[class*='prompt']", "[class*='question']",
+                "blockquote", "h2", "h3", "h4", "p"
+            ];
+            for (let sel of PROMPT_SELS) {
+                const els = Array.from(document.querySelectorAll(sel));
+                for (let el of els) {
+                    if (el.closest("nav, footer, header")) continue;
+                    const t = (el.innerText || "").trim();
+                    if (isGoodPrompt(t)) return t;
+                }
             }
             return "";
         }''')
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"prompt scrape js error: {e}")
 
-    if not prompt_text:
-        try:
-            el = page.locator("p").first
-            if await el.count() > 0:
-                prompt_text = (await el.inner_text()).strip()
-        except Exception:
-            pass
+    # Normalise and fallback
+    if prompt_text:
+        prompt_text = prompt_text.strip()
+    if not prompt_text or prompt_text.lower().rstrip(" *") in (
+        "your reflection", "reflection", "enter your response",
+        "write your reflection", "required"
+    ):
+        prompt_text = f"What key lessons and insights did you take away from reading '{art_title}'?"
+        log.info(f"   No specific prompt found — using article-title fallback prompt")
 
     log.info(f"Reflection Prompt Question: {prompt_text!r}")
 
-    reflection = pre_reflection
-    if not reflection:
-        log.info("   Calling agy for reflection...")
-        reflection = call_agy(art_title, art_body, prompt_text)
+    log.info("   Calling agy for reflection with exact prompt question...")
+    reflection = call_agy(art_title, art_body, prompt_text)
 
     log_event("reflection_generated", lesson_title=lesson.title,
               article_title=art_title, reflection=reflection,
