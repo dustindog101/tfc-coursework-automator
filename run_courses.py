@@ -349,10 +349,10 @@ def _build_opencode_cmd(system_prompt: str) -> tuple[list[str], Optional[str]]:
     ], tmp.name
 
 
-def _run_llm_prompt(system_prompt: str) -> Optional[str]:
+def _run_llm_prompt(system_prompt: str) -> Optional[tuple[str, str]]:
     """
     Try agy → opencode (mimo) → return None.
-    Returns clean reflection text or None on all failures.
+    Returns (reflection text, source) or None on all failures.
     """
     # ── 1. Try agy ────────────────────────────────────────────────────────────
     try:
@@ -364,7 +364,7 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
             text = _extract_prose(_clean_llm_text(result.stdout))
             if len(text) >= REFLECTION_MIN:
                 log.info(f"agy reflection ({len(text)} chars): {text!r}")
-                return text
+                return text, "agy"
             log.warning(f"agy output too short ({len(text)} chars): {text!r}")
         elif _agy_hit_limit(result):
             log.warning("agy quota/rate limit hit — trying opencode fallback")
@@ -388,7 +388,7 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
             prose = _extract_prose(_clean_llm_text(result.stdout))
             if len(prose) >= REFLECTION_MIN:
                 log.info(f"opencode reflection ({len(prose)} chars): {prose!r}")
-                return prose
+                return prose, "opencode"
             log.warning(f"opencode output too short ({len(prose)} chars)")
         else:
             log.warning(f"opencode exit {result.returncode}: {result.stderr[:200]}")
@@ -408,9 +408,10 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
     return None
 
 
-def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
+def call_agy(article_title: str, article_body: str, prompt_text: str) -> tuple[str, str]:
     """
     Generate a reflection via agy → opencode → hardcoded fallback chain.
+    Returns (reflection_text, source) where source is agy|opencode|fallback.
     """
     system_prompt = (
         "- Include multiple natural typing and writing errors: missing apostrophes (e.g. 'dont', 'im', 'cant'), minor casual typos, lowercased sentence start, informal phrasing, missing commas.\n"
@@ -425,15 +426,29 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
 
     result = _run_llm_prompt(system_prompt)
     if result:
-        if len(result) > REFLECTION_MAX:
-            cut = result.rfind(".", REFLECTION_MIN, REFLECTION_MAX)
-            result = result[:cut + 1] if cut > REFLECTION_MIN else result[:REFLECTION_MAX]
-        return result
+        text, source = result
+        if len(text) > REFLECTION_MAX:
+            cut = text.rfind(".", REFLECTION_MIN, REFLECTION_MAX)
+            text = text[:cut + 1] if cut > REFLECTION_MIN else text[:REFLECTION_MAX]
+        return text, source
 
-    # ── 3. Hardcoded fallback ─────────────────────────────────────────────────
     r = random.choice(_FALLBACKS)
     log.warning(f"agy and opencode failed — using hardcoded fallback ({len(r)} chars)")
-    return r
+    return r, "fallback"
+
+
+def log_reflection_generated(
+    lesson_title: str, article_title: str, reflection: str, source: str,
+) -> None:
+    """Write reflection to events.jsonl so menubar can display it immediately."""
+    log_event(
+        "reflection_generated",
+        lesson_title=lesson_title,
+        article_title=article_title,
+        reflection=reflection,
+        chars=len(reflection),
+        source=source,
+    )
 
 
 def default_reflect_prompt(title: str) -> str:
@@ -907,8 +922,8 @@ async def wait_for_timer(
 async def reading_phase(
     page, lesson: LessonEntry, hours_done: float, hours_today: float,
     hours_total: float, rs: Optional[RunState] = None,
-) -> tuple[str, str, str, str]:
-    """Returns (article_title, article_body, pre_reflection, lesson_prompt)."""
+) -> tuple[str, str, str, str, str]:
+    """Returns (article_title, article_body, pre_reflection, lesson_prompt, reflection_source)."""
     log.info(f"📖 Reading: {lesson.title!r} — {lesson.url}")
     log_event("reading_start", lesson_url=lesson.url, lesson_title=lesson.title)
 
@@ -936,13 +951,15 @@ async def reading_phase(
     else:
         log.info("   No reading timer")
 
-    reflection = await agy_task
-    return title, body, reflection, lesson_prompt
+    reflection, reflection_source = await agy_task
+    log_reflection_generated(lesson.title, title, reflection, reflection_source)
+    return title, body, reflection, lesson_prompt, reflection_source
 
 
 async def reflect_phase(
     page, lesson: LessonEntry, art_title: str, art_body: str, pre_reflection: str,
     hours_done: float, hours_today: float, hours_total: float,
+    pre_source: str = "",
     rs: Optional[RunState] = None,
 ) -> bool:
     reflect_url = lesson.url.rstrip("/") + "/reflect"
@@ -963,13 +980,17 @@ async def reflect_phase(
     log.info(f"Reflection Prompt Question: {lesson_prompt!r}")
 
     reflection = pre_reflection
-    if not reflection:
-        log.info("   Calling LLM for reflection...")
-        reflection = call_agy(art_title, art_body, lesson_prompt)
+    reflection_source = pre_source
+    if reflection and reflection_source not in ("", "fallback"):
+        log.info(f"   Using pre-generated reflection from {reflection_source} ({len(reflection)} chars)")
+    else:
+        if reflection and reflection_source == "fallback":
+            log.info("   Pre-generated reflection was hardcoded fallback — retrying LLM...")
+        else:
+            log.info("   Calling LLM for reflection...")
+        reflection, reflection_source = call_agy(art_title, art_body, lesson_prompt)
 
-    log_event("reflection_generated", lesson_title=lesson.title,
-              article_title=art_title, reflection=reflection,
-              chars=len(reflection), source="agy")
+    log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
 
     filled_len = 0
     for sel in ["#reflection-response", "textarea[placeholder*='minimum' i]", "textarea"]:
@@ -1275,9 +1296,10 @@ async def process_lesson(
         "It discussed community impact, personal responsibility, and evidence-based approaches."
     )
     reflection = ""
+    reflection_source = ""
 
     if state == "needs_read":
-        art_title, art_body, reflection, _ = await reading_phase(
+        art_title, art_body, reflection, _, reflection_source = await reading_phase(
             page, lesson, prog["done"], hours_today, prog["total"], rs
         )
     elif state == "needs_reflect":
@@ -1297,7 +1319,7 @@ async def process_lesson(
     success = await reflect_phase(
         page, lesson, art_title, art_body, reflection,
         prog_before["done"], hours_today, prog_before["total"],
-        rs=rs,
+        pre_source=reflection_source, rs=rs,
     )
 
     prog_after = await get_progress(page)

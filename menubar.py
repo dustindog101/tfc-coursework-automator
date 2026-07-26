@@ -61,6 +61,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.progress = {"done": 18.8, "total": 75.0, "remaining": 56.2}
         self.current_lesson = "None"
         self.upcoming_reflection = "No reflection generated yet."
+        self.upcoming_reflection_source = ""
         self.daily_limit_reached = False
         self.last_state_id = "INIT"
         self.last_notified_state = "INIT"
@@ -475,6 +476,7 @@ class TFCCourseworkMenuApp(rumps.App):
                     refl = ev.get("reflection", "")
                     if refl:
                         self.upcoming_reflection = refl
+                        self.upcoming_reflection_source = ev.get("source", "")
                         break
                         
             # Latest catalog_snapshot for total site completed
@@ -532,7 +534,8 @@ class TFCCourseworkMenuApp(rumps.App):
                 elif event_name == "reflect_start":
                     history_items.append(f"{t_prefix}✍️ Reflecting: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "reflection_generated":
-                    history_items.append(f"{t_prefix}📝 AI Reflection Ready ({ev.get('chars')} chars)")
+                    src = ev.get("source", "?")
+                    history_items.append(f"{t_prefix}📝 AI Reflection Ready [{src}] ({ev.get('chars')} chars)")
                 elif event_name == "reflect_submitted":
                     history_items.append(f"{t_prefix}📤 Submitted Reflection: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "lesson_complete":
@@ -766,7 +769,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu_reflection.title = "📝 Upcoming AI Reflection"
         if self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
             preview = self.upcoming_reflection[:35] + "..." if len(self.upcoming_reflection) > 35 else self.upcoming_reflection
-            self.item_refl_preview.title = f"Draft: \"{preview}\""
+            src = self.upcoming_reflection_source or "?"
+            self.item_refl_preview.title = f"Draft [{src}]: \"{preview}\""
         else:
             self.item_refl_preview.title = "Draft: None ready"
 

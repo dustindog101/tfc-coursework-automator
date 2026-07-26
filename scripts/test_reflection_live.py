@@ -57,8 +57,9 @@ def main():
     print("TEST 2: agy + opencode both fail -> hardcoded fallback")
     print("=" * 60)
     with patch.object(rc, "_run_llm_prompt", return_value=None):
-        fallback = rc.call_agy(SAMPLE_TITLE, SAMPLE_BODY, SAMPLE_PROMPT)
+        fallback, source = rc.call_agy(SAMPLE_TITLE, SAMPLE_BODY, SAMPLE_PROMPT)
     print("OUTPUT:", fallback)
+    print("SOURCE:", source)
     print("IN_FALLBACKS:", fallback in rc._FALLBACKS)
     print()
 

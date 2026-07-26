@@ -34,8 +34,9 @@ class TestLLMChain(unittest.TestCase):
     def test_fallback_is_random_from_four(self):
         self.assertEqual(len(rc._FALLBACKS), 4)
         with patch.object(rc, "_run_llm_prompt", return_value=None):
-            out = rc.call_agy("Title", "Body", "Prompt?")
+            out, source = rc.call_agy("Title", "Body", "Prompt?")
         self.assertIn(out, rc._FALLBACKS)
+        self.assertEqual(source, "fallback")
 
     def test_default_reflect_prompt(self):
         prompt = rc.default_reflect_prompt("Addiction Basics")
@@ -48,6 +49,8 @@ class TestLLMChain(unittest.TestCase):
         mock_run.return_value.stderr = ""
         out = rc._run_llm_prompt("test prompt")
         self.assertIsNotNone(out)
+        text, source = out
+        self.assertEqual(source, "agy")
         self.assertEqual(mock_run.call_args[0][0][0], "agy")
 
     @patch("run_courses.subprocess.run")
@@ -57,6 +60,8 @@ class TestLLMChain(unittest.TestCase):
         mock_run.side_effect = [agy_fail, opencode_ok]
         out = rc._run_llm_prompt("test prompt")
         self.assertIsNotNone(out)
+        text, source = out
+        self.assertEqual(source, "opencode")
         self.assertEqual(mock_run.call_args_list[1][0][0][0], "opencode")
 
 
