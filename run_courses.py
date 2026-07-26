@@ -337,20 +337,11 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
 
     # ── 2. Try opencode ───────────────────────────────────────────────────────
     try:
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as tmp:
-            tmp.write(system_prompt)
-            tmp_path = tmp.name
-        try:
-            result = subprocess.run(
-                ["opencode", "run", "--file", tmp_path, "Write only the reflection text, no preamble."],
-                capture_output=True, text=True, timeout=90, cwd=ROOT_DIR,
-            )
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+        # opencode run [message..] — pass full prompt as single element; subprocess handles quoting
+        result = subprocess.run(
+            ["opencode", "run", system_prompt],
+            capture_output=True, text=True, timeout=120, cwd=ROOT_DIR,
+        )
 
         if result.returncode == 0:
             # opencode outputs the raw response text on stdout
@@ -524,25 +515,39 @@ async def extract_article(page) -> tuple[str, str, str]:
             ];
             const CLUTTER_TAGS = new Set(["button", "nav", "footer", "header", "script", "style", "noscript"]);
             const MIN_PARA_LEN = 40;
-            const GENERIC_PROMPTS = new Set([
+            // These are the GENERIC site-wide prompts that appear on /reflect — exclude from body and prompt
+            const GENERIC_PROMPTS = [
                 "please share your thoughts on the article you just read.",
                 "what did you take away from this article?",
                 "write your reflection here",
-                "enter your response"
-            ]);
+                "enter your response",
+                "how relevant was the information",
+                "what improvements, if any",
+                "do you have any other feedback"
+            ];
+
+            // Detect if we're on the /reflect page (not the article reading page)
+            const isReflectPage = window.location.pathname.endsWith("/reflect");
+
+            function isGenericPrompt(text) {
+                const lower = text.trim().toLowerCase();
+                for (let gp of GENERIC_PROMPTS) { if (lower.startsWith(gp)) return true; }
+                return false;
+            }
 
             function isClutter(el, text) {
                 if (CLUTTER_TAGS.has(el.tagName.toLowerCase())) return true;
                 if (el.closest("nav, footer, header, [role='navigation']")) return true;
                 const lower = text.toLowerCase();
                 for (let w of CLUTTER_WORDS) { if (lower.includes(w)) return true; }
+                if (isGenericPrompt(text)) return true;
                 return false;
             }
 
             function isGoodPrompt(text) {
                 if (!text || text.trim().length < 15) return false;
+                if (isGenericPrompt(text)) return false;
                 const lower = text.trim().toLowerCase();
-                for (let gp of GENERIC_PROMPTS) { if (lower.startsWith(gp)) return false; }
                 return (
                     text.includes("?") ||
                     lower.startsWith("describe") ||
@@ -557,69 +562,93 @@ async def extract_article(page) -> tuple[str, str, str]:
                 );
             }
 
-            // Strategy 1: find specific lesson prompt on article page
-            // Often appears near reflection/question sections with class or heading cues
+            // ── Lesson Prompt Extraction ─────────────────────────────────────
+            // Priority 1: Numbered <li> items at the bottom (e.g. "1. What physical symptoms...")
+            // These are the actual per-lesson reflection questions embedded in the article
             let lessonPrompt = "";
-            const PROMPT_SELS = [
-                ".reflection-prompt", ".reflection-question", ".prompt",
-                ".question", "[class*='prompt']", "[class*='question']",
-                "blockquote", "h2", "h3", "h4"
-            ];
-            for (let sel of PROMPT_SELS) {
-                const els = Array.from(document.querySelectorAll(sel));
-                for (let el of els) {
+            if (!isReflectPage) {
+                const liEls = Array.from(document.querySelectorAll("li"));
+                for (let el of liEls) {
                     if (el.closest("nav, footer, header")) continue;
                     const t = (el.innerText || "").trim();
-                    if (isGoodPrompt(t) && t.length < 400) { lessonPrompt = t; break; }
+                    // Numbered reflection questions look like "1. Have you ever..." or "2. If you reflect..."
+                    if (/^\\d+\\.\\s+/.test(t) && isGoodPrompt(t) && t.length < 500) {
+                        lessonPrompt = t.replace(/^\\d+\\.\\s+/, "").trim();
+                        break;
+                    }
                 }
-                if (lessonPrompt) break;
-            }
-            // Also scan <p> tags for question-style prompts (catches inline prompts)
-            if (!lessonPrompt) {
-                const paras = Array.from(document.querySelectorAll("p"));
-                for (let el of paras) {
-                    if (el.closest("nav, footer, header")) continue;
-                    const t = (el.innerText || "").trim();
-                    if (isGoodPrompt(t) && t.length < 400 && t.includes("?")) {
-                        lessonPrompt = t; break;
+
+                // Priority 2: Class-based selectors
+                if (!lessonPrompt) {
+                    for (let sel of [".reflection-prompt", ".reflection-question", ".prompt", ".question",
+                                     "[class*='prompt']", "[class*='question']", "blockquote", "h2", "h3", "h4"]) {
+                        const els = Array.from(document.querySelectorAll(sel));
+                        for (let el of els) {
+                            if (el.closest("nav, footer, header")) continue;
+                            const t = (el.innerText || "").trim();
+                            if (isGoodPrompt(t) && t.length < 400) { lessonPrompt = t; break; }
+                        }
+                        if (lessonPrompt) break;
+                    }
+                }
+
+                // Priority 3: <p> tags with question marks
+                if (!lessonPrompt) {
+                    for (let el of document.querySelectorAll("p")) {
+                        if (el.closest("nav, footer, header")) continue;
+                        const t = (el.innerText || "").trim();
+                        if (isGoodPrompt(t) && t.includes("?") && t.length < 400) {
+                            lessonPrompt = t; break;
+                        }
                     }
                 }
             }
 
-            // Strategy 2: body extraction (multi-container)
-            const CONTAINER_SELS = [
-                "article", "main", ".prose", ".article-body", ".lesson-content",
-                ".course-content", "#content", "[class*='content']", "[class*='article']",
-                "[class*='lesson']", "[class*='course']"
-            ];
-            let container = null;
-            for (let sel of CONTAINER_SELS) {
-                const el = document.querySelector(sel);
-                if (el) { container = el; break; }
+            // ── Body Extraction ──────────────────────────────────────────────
+            // Only extract body on the article reading page, not /reflect
+            let bodyText = "";
+            if (!isReflectPage) {
+                const CONTAINER_SELS = [
+                    "article", "main", ".prose", ".article-body", ".lesson-content",
+                    ".course-content", "#content", "[class*='content']", "[class*='article']",
+                    "[class*='lesson']", "[class*='course']"
+                ];
+                let container = null;
+                for (let sel of CONTAINER_SELS) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+
+                let elements = [];
+                if (container) {
+                    elements = Array.from(container.querySelectorAll("p, h2, h3, h4, li"));
+                    if (elements.length === 0) elements = [container];
+                }
+                if (elements.length === 0) {
+                    elements = Array.from(document.querySelectorAll("p, li"));
+                }
+
+                const seen = new Set();
+                const texts = [];
+                for (let el of elements) {
+                    const text = (el.innerText || "").trim();
+                    if (!text || text.length < MIN_PARA_LEN) continue;
+                    if (seen.has(text)) continue;
+                    if (isClutter(el, text)) continue;
+                    // Skip numbered reflection question li items from body (they're the prompt)
+                    if (/^\\d+\\.\\s+/.test(text) && text.includes("?")) continue;
+                    seen.add(text);
+                    texts.push(text);
+                    if (texts.join("\\n\\n").length > 3500) break;
+                }
+                bodyText = texts.join("\\n\\n");
             }
 
-            let elements = [];
-            if (container) {
-                elements = Array.from(container.querySelectorAll("p, h2, h3, h4, li"));
-                if (elements.length === 0) elements = [container];
-            }
-            if (elements.length === 0) {
-                elements = Array.from(document.querySelectorAll("p, li"));
-            }
-
-            const seen = new Set();
-            const texts = [];
-            for (let el of elements) {
-                const text = (el.innerText || "").trim();
-                if (!text || text.length < MIN_PARA_LEN) continue;
-                if (seen.has(text)) continue;
-                if (isClutter(el, text)) continue;
-                seen.add(text);
-                texts.push(text);
-                if (texts.join("\\n\\n").length > 3500) break;
-            }
-            return { body: texts.join("\\n\\n"), prompt: lessonPrompt };
+            return { body: bodyText, prompt: lessonPrompt, isReflectPage };
         }''')
+
+        if result.get("isReflectPage"):
+            log.info("   extract_article: on /reflect page — body/prompt skipped (will use fallback)")
 
         if result.get("body") and len(result["body"].strip()) > 80:
             body = result["body"][:3000]
@@ -628,7 +657,9 @@ async def extract_article(page) -> tuple[str, str, str]:
 
         if result.get("prompt"):
             lesson_prompt = result["prompt"].strip()
-            log.info(f"   Lesson prompt found on article page: {lesson_prompt!r}")
+            log.info(f"   Lesson prompt from article page: {lesson_prompt!r}")
+        elif not result.get("isReflectPage"):
+            log.info("   No lesson-specific prompt found on article page")
 
     except Exception as e:
         log.warning(f"article extract: {e}")
