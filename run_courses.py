@@ -1490,15 +1490,15 @@ async def process_lesson(
 
 
 def rotate_logs_if_large():
-    """Truncate logs to the last 200 lines if they exceed 100 KB."""
+    """Truncate logs to the last 500 lines if they exceed 150 KB."""
     for filepath in [LOG_FILE, EVENTS_FILE]:
         try:
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 100 * 1024:
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 150 * 1024:
                 with open(filepath, "r", encoding="utf-8") as f:
                     lines = f.readlines()
                 with open(filepath, "w", encoding="utf-8") as f:
-                    f.writelines(lines[-200:])
-                log.info(f"Rotated {os.path.basename(filepath)} (was > 100 KB)")
+                    f.writelines(lines[-500:])
+                log.info(f"Rotated {os.path.basename(filepath)} (was > 150 KB, kept last 500 lines)")
         except Exception as e:
             log.warning(f"Failed to rotate {filepath}: {e}")
 
