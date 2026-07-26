@@ -117,7 +117,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_set_headed = rumps.MenuItem("👁️ Browser Mode Toggle: Headless", callback=self.toggle_headed)
         self.item_set_autostart = rumps.MenuItem("🚀 macOS Start on Login: OFF", callback=self.toggle_autostart)
         self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart Toggle: ON", callback=self.toggle_watchdog)
-        self.item_set_caffeinate = rumps.MenuItem("☕ Smart Caffeinate (Active Only): ON", callback=self.toggle_caffeinate)
+        self.item_set_caffeinate = rumps.MenuItem("☕ Smart Caffeinate: ON", callback=self.toggle_caffeinate)
         self.item_set_display = rumps.MenuItem("📺 Title Display Mode: Auto", callback=self.cycle_display_mode)
         self.item_set_env = rumps.MenuItem("✏️ Edit Credentials (.env)", callback=self.edit_env)
         self.menu_settings.update([
@@ -317,10 +317,10 @@ class TFCCourseworkMenuApp(rumps.App):
         os.environ["ENABLE_CAFFEINATE"] = new_val
 
         if new_val == "1":
-            self.item_set_caffeinate.title = "☕ Smart Caffeinate (Active Only): ON"
-            rumps.notification("TFC Settings", "Smart Caffeinate Enabled ☕", "Mac stays awake ONLY during active coursework. Released during daily limit wait!")
+            self.item_set_caffeinate.title = "☕ Smart Caffeinate: ON"
+            rumps.notification("TFC Settings", "Smart Caffeinate Enabled ☕", "Mac stays awake during active coursework. Released during daily limit wait.")
         else:
-            self.item_set_caffeinate.title = "☕ Smart Caffeinate (Active Only): OFF"
+            self.item_set_caffeinate.title = "☕ Smart Caffeinate: OFF"
             rumps.notification("TFC Settings", "Smart Caffeinate Disabled", "Standard macOS power sleep settings active.")
 
     def cycle_display_mode(self, _):
@@ -604,15 +604,11 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h)"
 
         # 3. Update Reflection Draft UI
-        if is_limit_wait or is_retrying_after_midnight:
-            self.menu_reflection.title = "🌙 Limit Wait Active (Auto-generates at 12:00 AM)"
-            self.item_refl_preview.title = "Draft: None ready"
-        elif self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
-            self.menu_reflection.title = "📝 Drafted Reflection (Copy to Clipboard)"
+        self.menu_reflection.title = "📝 Upcoming AI Reflection"
+        if self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
             preview = self.upcoming_reflection[:35] + "..." if len(self.upcoming_reflection) > 35 else self.upcoming_reflection
             self.item_refl_preview.title = f"Draft: \"{preview}\""
         else:
-            self.menu_reflection.title = "📝 Upcoming AI Reflection"
             self.item_refl_preview.title = "Draft: None ready"
 
         # Apply Display Mode Title

@@ -99,6 +99,7 @@ Prefer a clean menu bar interface? Launch `./run_menubar.sh` for a lightweight m
 | **⏱️ Dual Timer Support** | Intelligently handles both the **article reading countdown** and the **reflection submit-lock timer** on the page. |
 | **🌙 Daily Limit Auto-Wait** | Detects when today's 8.0h limit is reached, notifies you, displays a live reset countdown, and resumes automatically at midnight. |
 | **🔄 Anti-Logout Keep-Alive** | Executes subtle micro-scrolls every 2.75 minutes to keep Supabase SPA authentication tokens fresh indefinitely. |
+| **☕ Smart Caffeinate Power Control** | Keeps macOS awake during active coursework, then releases sleep lock on daily limit wait so your Mac can sleep until midnight. Toggleable in Menu Bar Settings. |
 | **📊 JSONL Auditing** | Produces clean human-readable logs (`automation.log`) and machine-auditable JSON events (`events.jsonl`). |
 
 ---
