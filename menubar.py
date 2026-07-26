@@ -455,11 +455,19 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception:
                 pass
                 
+        prof_file = os.path.join(ROOT_DIR, "user_profile.json")
+        if os.path.exists(prof_file):
+            try:
+                with open(prof_file, "r", encoding="utf-8") as f:
+                    self.profile = json.load(f)
+            except Exception:
+                pass
+
         if events:
             # Latest user profile
             for ev in reversed(events):
                 if ev.get("event") == "user_profile_loaded":
-                    self.profile = ev
+                    self.profile.update(ev)
                     break
             
             # Latest progress snapshot or hours_done from events
@@ -655,12 +663,12 @@ class TFCCourseworkMenuApp(rumps.App):
             self.menu_site_completed.add(rumps.MenuItem("No completed courses loaded yet"))
 
         # 2. Update Profile & Progress UI
-        name = self.profile.get("FULL NAME") or self.profile.get("name") or "Unknown"
-        email = self.profile.get("EMAIL (READ-ONLY)") or self.profile.get("email") or "Unknown"
-        dob = self.profile.get("DATE OF BIRTH") or self.profile.get("dob") or "Unknown"
-        reason = self.profile.get("COMMUNITY SERVICE RELATED TO") or self.profile.get("reason") or "Unknown"
-        addr = self.profile.get("ADDRESS") or self.profile.get("address") or "Unknown"
-        eid = self.profile.get("ENROLLMENT PROOF ID") or self.profile.get("enrollment_id") or "Unknown"
+        name = self.profile.get("FULL NAME") or self.profile.get("name") or "amanuel hailie"
+        email = self.profile.get("EMAIL (READ-ONLY)") or self.profile.get("email") or "tfc@cybershare.tech"
+        dob = self.profile.get("DATE OF BIRTH") or self.profile.get("dob") or "2005-10-11"
+        reason = self.profile.get("COMMUNITY SERVICE RELATED TO") or self.profile.get("reason") or "Drug Possession"
+        addr = self.profile.get("ADDRESS") or self.profile.get("address") or "217 spring ave, rockville, Maryland 20850"
+        eid = self.profile.get("ENROLLMENT PROOF ID") or self.profile.get("enrollment_id") or "e70e6763-2e7f-4970-a48b-2a582338f41a"
         
         self.item_prof_name.title = f"• Full Name: {name}"
         self.item_prof_email.title = f"• Email: {email}"

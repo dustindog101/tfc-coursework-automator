@@ -1297,6 +1297,12 @@ def log_user_profile(user_info: dict, prog: dict):
         log.info(f"│ {'HOURS REMAINING':<30}: {prog.get('remaining', 0):.1f}h")
 
     log.info("╰────────────────────────────────────────────────────────╯")
+    prof_path = os.path.join(ROOT_DIR, "user_profile.json")
+    try:
+        with open(prof_path, "w", encoding="utf-8") as f:
+            json.dump(user_info, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save user_profile.json: {e}")
     log_event("user_profile_loaded", **user_info)
 
 
