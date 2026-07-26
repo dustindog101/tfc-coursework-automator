@@ -435,6 +435,28 @@ class TFCCourseworkMenuApp(rumps.App):
                         self.upcoming_reflection = refl
                         break
                         
+            # Latest timer_tick
+            for ev in reversed(events):
+                if ev.get("event") == "timer_tick":
+                    timer_secs = ev.get("timer_secs", 0)
+                    phase = ev.get("phase", "")
+                    lesson_title = ev.get("lesson_title", "")
+                    if lesson_title:
+                        self.current_lesson = lesson_title
+                        
+                    mins = timer_secs // 60
+                    secs = timer_secs % 60
+                    if secs > 0:
+                        fmt_time = f"{mins}m {secs}s"
+                    else:
+                        fmt_time = f"{mins}m"
+                        
+                    if phase == "READ":
+                        read_timer_str = fmt_time
+                    elif phase == "REFLECT":
+                        submit_timer_str = fmt_time
+                    break
+                        
             # Get today's hours if available
             for ev in reversed(events):
                 if "hours_today" in ev:
@@ -462,6 +484,8 @@ class TFCCourseworkMenuApp(rumps.App):
                     history_items.append(f"{t_prefix}⛔ Daily Limit Hit ({ev.get('hours_today')}h/8.0h)")
                 elif event_name == "daily_limit_wait_start":
                     history_items.append(f"{t_prefix}🌙 Waiting for Midnight Reset")
+                elif event_name == "daily_limit_reset_detected":
+                    history_items.append(f"{t_prefix}🌅 Midnight Reset Detected")
                 elif event_name == "bot_start":
                     history_items.append(f"{t_prefix}🚀 Bot Engine Started")
                     
@@ -498,12 +522,23 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_prof_remaining.title = f"• Remaining Hours: {rem:.1f}h"
 
         # 4. Parse automation.log for live lesson, phase & timers
-        read_timer_str = "N/A"
-        submit_timer_str = "N/A"
+        if "read_timer_str" not in locals():
+            read_timer_str = "N/A"
+        if "submit_timer_str" not in locals():
+            submit_timer_str = "N/A"
         limit_timer_str = "N/A"
         is_limit_wait = False
         is_retrying_after_midnight = False
 
+        if events:
+            for ev in reversed(events):
+                if ev.get("event") == "timer_tick":
+                    self.current_lesson = ev.get("lesson_title", self.current_lesson)
+                    if not self.current_lesson.startswith("Lesson #"):
+                        self.current_lesson = f"Lesson #{self.current_lesson}"
+                    
+                    timer_secs = ev.get("timer_secs", 0)
+                    mins, secs = divmod(timer_secs, 60)
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -518,15 +553,15 @@ class TFCCourseworkMenuApp(rumps.App):
                             break
                         if "[READ]" in line or "[REFLECT]" in line:
                             is_limit_wait = False
-                            m_l = re.search(r"Lesson #[^\s']+", line)
-                            if m_l:
-                                self.current_lesson = m_l.group(0)
-                            m_t = re.search(r"⏱\s*(\d+:\d+|\d+h\s*\d+m)", line)
-                            if m_t:
-                                if "[READ]" in line:
-                                    read_timer_str = m_t.group(1)
-                                else:
-                                    submit_timer_str = m_t.group(1)
+                                m_l = re.search(r"Lesson #[^\s']+", line)
+                                if m_l:
+                                    self.current_lesson = m_l.group(0)
+                                m_t = re.search(r"⏱\s*(\d+:\d+|\d+h\s*\d+m)", line)
+                                if m_t:
+                                    if "[READ]" in line:
+                                        read_timer_str = m_t.group(1)
+                                    else:
+                                        submit_timer_str = m_t.group(1)
                             break
             except Exception:
                 pass
