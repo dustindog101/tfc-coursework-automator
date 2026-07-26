@@ -117,12 +117,14 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_set_headed = rumps.MenuItem("👁️ Browser Mode Toggle: Headless", callback=self.toggle_headed)
         self.item_set_autostart = rumps.MenuItem("🚀 macOS Start on Login: OFF", callback=self.toggle_autostart)
         self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart Toggle: ON", callback=self.toggle_watchdog)
+        self.item_set_caffeinate = rumps.MenuItem("☕ Smart Caffeinate (Active Only): ON", callback=self.toggle_caffeinate)
         self.item_set_display = rumps.MenuItem("📺 Title Display Mode: Auto", callback=self.cycle_display_mode)
         self.item_set_env = rumps.MenuItem("✏️ Edit Credentials (.env)", callback=self.edit_env)
         self.menu_settings.update([
             self.item_set_headed,
             self.item_set_autostart,
             self.item_set_watchdog,
+            self.item_set_caffeinate,
             self.item_set_display,
             None,
             self.item_set_env
@@ -295,6 +297,31 @@ class TFCCourseworkMenuApp(rumps.App):
         else:
             self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart Toggle: OFF"
             rumps.notification("TFC Settings", "Watchdog Disabled", "Automatic crash restart disabled.")
+
+    def toggle_caffeinate(self, _):
+        """Toggle Smart Caffeinate power management setting."""
+        caff_on = os.getenv("ENABLE_CAFFEINATE", "1") == "1"
+        new_val = "0" if caff_on else "1"
+        
+        # Update .env file
+        env_path = os.path.join(ROOT_DIR, ".env")
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if "ENABLE_CAFFEINATE=" in content:
+                content = re.sub(r"ENABLE_CAFFEINATE=\d", f"ENABLE_CAFFEINATE={new_val}", content)
+            else:
+                content += f"\nENABLE_CAFFEINATE={new_val}\n"
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        os.environ["ENABLE_CAFFEINATE"] = new_val
+
+        if new_val == "1":
+            self.item_set_caffeinate.title = "☕ Smart Caffeinate (Active Only): ON"
+            rumps.notification("TFC Settings", "Smart Caffeinate Enabled ☕", "Mac stays awake ONLY during active coursework. Released during daily limit wait!")
+        else:
+            self.item_set_caffeinate.title = "☕ Smart Caffeinate (Active Only): OFF"
+            rumps.notification("TFC Settings", "Smart Caffeinate Disabled", "Standard macOS power sleep settings active.")
 
     def cycle_display_mode(self, _):
         """Cycle through menu bar title display modes."""
