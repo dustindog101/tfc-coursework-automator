@@ -47,6 +47,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.upcoming_reflection = "No reflection generated yet."
         self.daily_limit_reached = False
         self.last_state_id = "INIT"
+        self.display_mode = "auto"
+        self.hours_today = 0.0
         
         # User settings
         self.headed_mode = False        # Headless by default
@@ -105,11 +107,29 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_set_headed = rumps.MenuItem("👁️ Browser Mode Toggle: Headless", callback=self.toggle_headed)
         self.item_set_autostart = rumps.MenuItem("🚀 macOS Start on Login: OFF", callback=self.toggle_autostart)
         self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart Toggle: ON", callback=self.toggle_watchdog)
+        
+        self.menu_title_style = rumps.MenuItem("🎨 Menu Bar Title Style ▾")
+        self.item_mode_auto = rumps.MenuItem("Auto (Default)", callback=self.set_display_mode_auto)
+        self.item_mode_timers = rumps.MenuItem("Timers Focus Mode", callback=self.set_display_mode_timers)
+        self.item_mode_progress = rumps.MenuItem("Progress Focus Mode", callback=self.set_display_mode_progress)
+        self.item_mode_full = rumps.MenuItem("Full Detailed View", callback=self.set_display_mode_full)
+        self.item_mode_minimal = rumps.MenuItem("Minimal Status Badge", callback=self.set_display_mode_minimal)
+        
+        self.menu_title_style.update([
+            self.item_mode_auto,
+            self.item_mode_timers,
+            self.item_mode_progress,
+            self.item_mode_full,
+            self.item_mode_minimal
+        ])
+        self.item_mode_auto.state = 1
+        
         self.item_set_env = rumps.MenuItem("✏️ Edit Credentials (.env)", callback=self.edit_env)
         self.menu_settings.update([
             self.item_set_headed,
             self.item_set_autostart,
             self.item_set_watchdog,
+            self.menu_title_style,
             None,
             self.item_set_env
         ])
@@ -143,6 +163,27 @@ class TFCCourseworkMenuApp(rumps.App):
 
         # Auto-launch bot process in Headless mode by default
         self.ensure_bot_running_on_start()
+
+    def set_display_mode(self, mode, item):
+        self.display_mode = mode
+        for i in [self.item_mode_auto, self.item_mode_timers, self.item_mode_progress, self.item_mode_full, self.item_mode_minimal]:
+            i.state = 0
+        item.state = 1
+
+    def set_display_mode_auto(self, sender):
+        self.set_display_mode("auto", sender)
+
+    def set_display_mode_timers(self, sender):
+        self.set_display_mode("timers", sender)
+
+    def set_display_mode_progress(self, sender):
+        self.set_display_mode("progress", sender)
+
+    def set_display_mode_full(self, sender):
+        self.set_display_mode("full", sender)
+
+    def set_display_mode_minimal(self, sender):
+        self.set_display_mode("minimal", sender)
 
     def is_bot_running(self):
         """Check if python3 run_courses.py is currently executing."""
@@ -365,6 +406,12 @@ class TFCCourseworkMenuApp(rumps.App):
                         self.upcoming_reflection = refl
                         break
                         
+            # Get today's hours if available
+            for ev in reversed(events):
+                if "hours_today" in ev:
+                    self.hours_today = float(ev["hours_today"])
+                    break
+                        
             # Event history items formatted in 12-hour local time
             history_items = []
             for ev in reversed(events[-15:]):
@@ -470,40 +517,81 @@ class TFCCourseworkMenuApp(rumps.App):
         calc_reset_str_secs = f"{h_rem:02d}h {m_rem:02d}m {s_rem:02d}s"
 
         new_state_id = ""
+        active_icon = "⏸️"
+        active_status_text = "Paused"
 
-        # Update UI according to active state
+        # Update status and state
         if is_limit_wait or is_retrying_after_midnight:
             new_state_id = "LIMIT"
-            # Title format: 🌙 Reset in 07h 42m | 8.0/8h (Assume they meant done_today/8.0h or something, 
-            # but standard is done/total, let's use done/total for consistency if not we can use 8.0/8h)
+            active_icon = "🌙"
             if is_retrying_after_midnight and diff_s == 0:
-                self.title = f"🔄 Reset Check (2m Retry) | {done:.1f}/{total:g}h"
+                active_status_text = "Reset Check (2m Retry)"
                 self.item_status.title = "🌙 Limit Wait - Retrying Reset"
                 self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
-                self.title = f"🌙 Reset in {calc_reset_str} | {done:.1f}/{total:g}h"
+                active_status_text = f"Reset in {calc_reset_str}"
                 self.item_status.title = "🌙 Limit Wait"
                 self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
-                
-            self.item_queue_today.title = "Logged Today: 8.0h / 8.0h (Limit Reached)"
+            self.item_queue_today.title = f"Logged Today: {self.hours_today:.1f}h / 8.0h (Limit Reached)"
             
         elif bot_active:
             new_state_id = "ACTIVE"
+            active_icon = "🟢"
             if read_timer_str != "N/A":
-                self.title = f"🟢 {read_timer_str} | {done:.1f}/{total:g}h"
+                active_icon = "📖"
+                active_status_text = read_timer_str
             elif submit_timer_str != "N/A":
-                self.title = f"🟢 Submit {submit_timer_str} | {done:.1f}/{total:g}h"
+                active_icon = "✍️"
+                active_status_text = f"Submit {submit_timer_str}"
             else:
-                self.title = f"🟢 Active | {done:.1f}/{total:g}h"
+                active_status_text = "Active"
                 
             self.item_status.title = "🟢 Active"
             self.item_queue_today.title = f"Logged Today: Processing ({done}h total)"
             
         else:
             new_state_id = "IDLE"
-            self.title = f"⏸️ Paused | {done:.1f}/{total:g}h"
+            active_icon = "⏸️"
+            active_status_text = "Paused"
             self.item_status.title = "⏸️ Paused"
             self.item_queue_today.title = f"Logged Today: Paused ({done:.1f}h total)"
+
+        # Apply Display Mode Title
+        if self.display_mode == "auto":
+            self.title = f"{active_icon} {active_status_text} | {done:.1f}/{total:g}h"
+        elif self.display_mode == "timers":
+            if new_state_id == "LIMIT":
+                self.title = f"🌙 Reset in {calc_reset_str_secs}"
+            elif new_state_id == "IDLE":
+                self.title = "⏸️ Paused"
+            else:
+                timers = []
+                if read_timer_str != "N/A": timers.append(f"📖 {read_timer_str}")
+                if submit_timer_str != "N/A": timers.append(f"✍️ Submit {submit_timer_str}")
+                if not timers:
+                    self.title = "🟢 Active"
+                else:
+                    self.title = " | ".join(timers)
+        elif self.display_mode == "progress":
+            self.title = f"📊 {done:.1f}/{total:.1f}h ({pct}%) | ⏳ {rem:.1f}h Left"
+        elif self.display_mode == "full":
+            self.title = f"{active_icon} {active_status_text} | 📊 {done:.1f}/{total:g}h ({pct}%) | 📅 {self.hours_today:.1f}/8h today"
+        elif self.display_mode == "minimal":
+            if new_state_id == "IDLE":
+                short_timer = "Paused"
+            elif new_state_id == "LIMIT":
+                if is_retrying_after_midnight and diff_s == 0:
+                    short_timer = "Retry"
+                else:
+                    short_timer = f"{h_rem}h" if h_rem > 0 else f"{m_rem}m"
+            else:
+                if read_timer_str != "N/A":
+                    short_timer = read_timer_str.split("m")[0] + "m" if "m" in read_timer_str else read_timer_str.split(":")[0] + "m"
+                elif submit_timer_str != "N/A":
+                    short_timer = submit_timer_str.split("m")[0] + "m" if "m" in submit_timer_str else submit_timer_str.split(":")[0] + "m"
+                else:
+                    short_timer = "Active"
+            self.title = f"{active_icon} {short_timer}"
 
         self.item_queue_lesson.title = f"Active Lesson: {self.current_lesson}"
         self.item_read_timer.title = f"• Reading Timer: {read_timer_str}"
