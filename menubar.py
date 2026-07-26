@@ -11,6 +11,7 @@ import re
 import subprocess
 import time
 from datetime import datetime, timedelta
+from collections import deque
 import rumps
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +48,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.upcoming_reflection = "No reflection generated yet."
         self.daily_limit_reached = False
         self.last_state_id = "INIT"
+        self.last_notified_state = "INIT"
+        self.consecutive_state_count = 0
         self.display_mode = "auto"
         self.hours_today = 0.0
         
@@ -62,8 +65,8 @@ class TFCCourseworkMenuApp(rumps.App):
         
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
-        self.item_queue_lesson = rumps.MenuItem("Active Lesson: None")
-        self.item_queue_today = rumps.MenuItem("Logged Today: 0.0h / 8.0h")
+        self.item_queue_lesson = rumps.MenuItem("📌 Active Lesson: None")
+        self.item_queue_today = rumps.MenuItem("📅 Logged Today:  [░░░░░░░░░░░░░░░░░░░░] 0% (0.0 / 8.0h)")
         self.menu_queue.update([self.item_queue_lesson, self.item_queue_today])
         
         # ── 3. Active Countdown Timers ───────────────────────────────────────
@@ -91,7 +94,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_prof_cat = rumps.MenuItem("• Offense Category: Checking...")
         self.item_prof_addr = rumps.MenuItem("• Location/Address: Checking...")
         self.item_prof_id = rumps.MenuItem("• Enrollment ID: Checking...")
-        self.item_prof_progress = rumps.MenuItem("• Progress: 18.8h / 75.0h (25%)")
+        self.item_prof_progress = rumps.MenuItem("📊 Total Progress: [█████░░░░░░░░░░░░░░░] 25% (18.8 / 75.0h)")
         self.item_prof_remaining = rumps.MenuItem("• Remaining Hours: 56.2h")
         self.menu_profile.update([
             self.item_prof_name, self.item_prof_email, self.item_prof_dob,
@@ -348,7 +351,7 @@ class TFCCourseworkMenuApp(rumps.App):
         if os.path.exists(EVENTS_FILE):
             try:
                 with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-                    for line in f:
+                    for line in deque(f, maxlen=500):
                         line = line.strip()
                         if line:
                             try:
@@ -434,15 +437,12 @@ class TFCCourseworkMenuApp(rumps.App):
         rem = self.progress.get("remaining", 0.0)
         pct = int((done / total) * 100) if total else 0
         
-        self.item_prof_progress.title = f"• Progress: {done}h / {total}h ({pct}%)"
-        self.item_prof_remaining.title = f"• Remaining Hours: {rem:.1f}h"
+        filled = int(round((pct / 100) * 20)) if total else 0
+        filled = max(0, min(20, filled))
+        bar = "█" * filled + "░" * (20 - filled)
         
-        # 3. Update Reflection Draft UI
-        if self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
-            preview = self.upcoming_reflection[:45] + "..." if len(self.upcoming_reflection) > 45 else self.upcoming_reflection
-            self.item_refl_preview.title = f"Draft: \"{preview}\""
-        else:
-            self.item_refl_preview.title = "Draft: None ready"
+        self.item_prof_progress.title = f"📊 Total Progress: [{bar}] {pct}% ({done} / {total}h)"
+        self.item_prof_remaining.title = f"• Remaining Hours: {rem:.1f}h"
 
         # 4. Parse automation.log for live lesson, phase & timers
         read_timer_str = "N/A"
@@ -454,8 +454,7 @@ class TFCCourseworkMenuApp(rumps.App):
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                    for line in reversed(lines[-50:]):
+                    for line in reversed(deque(f, maxlen=500)):
                         if "retrying in 2 minutes" in line or "Reset not updated on site yet" in line:
                             is_retrying_after_midnight = True
                         if "[LIMIT_WAIT]" in line or "LIMIT REACHED" in line:
@@ -504,6 +503,11 @@ class TFCCourseworkMenuApp(rumps.App):
         except (ValueError, TypeError):
             hrs_today_f = 0.0
 
+        daily_pct = int(min(100, max(0, (hrs_today_f / 8.0) * 100)))
+        daily_filled = int(round((daily_pct / 100.0) * 20))
+        daily_filled = max(0, min(20, daily_filled))
+        daily_bar = "█" * daily_filled + "░" * (20 - daily_filled)
+
         timer_part = ""
         icon = ""
         status_text = ""
@@ -523,7 +527,7 @@ class TFCCourseworkMenuApp(rumps.App):
                 self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
                 
             self.item_status.title = f"🌙 {status_text}"
-            self.item_queue_today.title = "Logged Today: 8.0h / 8.0h (Limit Reached)"
+            self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h - Limit Hit)"
             
         elif bot_active:
             new_state_id = "ACTIVE"
@@ -536,7 +540,7 @@ class TFCCourseworkMenuApp(rumps.App):
             status_text = "Active"
                 
             self.item_status.title = "🟢 Active"
-            self.item_queue_today.title = f"Logged Today: Processing ({done_f}h total)"
+            self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h)"
             
         else:
             new_state_id = "IDLE"
@@ -544,16 +548,38 @@ class TFCCourseworkMenuApp(rumps.App):
             timer_part = ""
             status_text = "Paused"
             self.item_status.title = "⏸️ Paused"
-            self.item_queue_today.title = f"Logged Today: Paused ({done_f:.1f}h total)"
+            self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h)"
+
+        # 3. Update Reflection Draft UI
+        if is_limit_wait or is_retrying_after_midnight:
+            self.menu_reflection.title = "🌙 Limit Wait Active — Next reflection will auto-generate at 12:00 AM local time"
+            self.item_refl_preview.title = "Draft: None ready"
+        elif self.upcoming_reflection and "No reflection" not in self.upcoming_reflection:
+            self.menu_reflection.title = "📝 Drafted Reflection (Copy to Clipboard)"
+            preview = self.upcoming_reflection[:45] + "..." if len(self.upcoming_reflection) > 45 else self.upcoming_reflection
+            self.item_refl_preview.title = f"Draft: \"{preview}\""
+        else:
+            self.menu_reflection.title = "📝 Upcoming AI Reflection"
+            self.item_refl_preview.title = "Draft: None ready"
 
         # Apply Display Mode Title
         prog_part = f"{done_f:.1f}/{total_f:g}h"
         
         display = getattr(self, 'display_mode', 'auto')
         
+        lesson_title_trunc = ""
+        if bot_active and self.current_lesson and self.current_lesson != "None":
+            lt = self.current_lesson.replace("Lesson #", "").strip()
+            if len(lt) > 16:
+                lt = lt[:15].strip() + "…"
+            lesson_title_trunc = f"📖 {lt} • "
+
         if display == "auto":
             if timer_part:
-                self.title = f"{icon} {timer_part} | {prog_part}"
+                if bot_active and lesson_title_trunc:
+                    self.title = f"{lesson_title_trunc}{timer_part} | {prog_part}"
+                else:
+                    self.title = f"{icon} {timer_part} | {prog_part}"
             else:
                 self.title = f"{icon} {status_text} | {prog_part}"
                 
@@ -576,7 +602,10 @@ class TFCCourseworkMenuApp(rumps.App):
             
         elif display == "full":
             disp_status = timer_part if timer_part else status_text
-            self.title = f"{icon} {disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h today"
+            if bot_active and lesson_title_trunc and timer_part:
+                self.title = f"{lesson_title_trunc}{disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h today"
+            else:
+                self.title = f"{icon} {disp_status} | 📊 {prog_part} ({pct}%) | 📅 {hrs_today_f:.1f}/8h today"
             
         elif display == "minimal":
             if new_state_id == "IDLE":
@@ -595,21 +624,28 @@ class TFCCourseworkMenuApp(rumps.App):
                     short_timer = "Active"
             self.title = f"{icon} {short_timer}"
 
-        self.item_queue_lesson.title = f"Active Lesson: {self.current_lesson}"
+        self.item_queue_lesson.title = f"📌 Active Lesson: {self.current_lesson}"
         self.item_read_timer.title = f"• Reading Timer: {read_timer_str}"
         self.item_submit_timer.title = f"• Reflection Submit-Lock Timer: {submit_timer_str}"
         
         if not is_limit_wait and not is_retrying_after_midnight:
              self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM Local Time)"
 
-        # Notifications for state transitions
-        if self.last_state_id != "INIT" and new_state_id != self.last_state_id:
-            if new_state_id == "ACTIVE":
-                rumps.notification("TFC Automator", "Status: Active 🟢", "Bot has resumed active coursework.")
-            elif new_state_id == "LIMIT":
-                rumps.notification("TFC Automator", "Status: Limit Wait 🌙", "Daily limit reached. Waiting for reset.")
-            elif new_state_id == "IDLE":
-                rumps.notification("TFC Automator", "Status: Paused ⏸️", "Automator is now idle/paused.")
+        # Notifications for state transitions (debounced)
+        if new_state_id == self.last_state_id:
+            self.consecutive_state_count += 1
+        else:
+            self.consecutive_state_count = 1
+
+        if self.consecutive_state_count >= 3:
+            if self.last_notified_state != "INIT" and new_state_id != self.last_notified_state:
+                if new_state_id == "ACTIVE":
+                    rumps.notification("TFC Automator", "Status: Active 🟢", "Bot has resumed active coursework.")
+                elif new_state_id == "LIMIT":
+                    rumps.notification("TFC Automator", "Status: Limit Wait 🌙", "Daily limit reached. Waiting for reset.")
+                elif new_state_id == "IDLE":
+                    rumps.notification("TFC Automator", "Status: Paused ⏸️", "Automator is now idle/paused.")
+                self.last_notified_state = new_state_id
         
         self.last_state_id = new_state_id
 
