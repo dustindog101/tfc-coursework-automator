@@ -481,9 +481,11 @@ async def get_progress(page) -> dict:
     return {"done": 0.0, "total": 75.0, "remaining": 75.0}
 
 
-async def extract_article(page) -> tuple[str, str]:
+async def extract_article(page) -> tuple[str, str, str]:
+    """Extract (title, body, lesson_prompt) from the article reading page."""
     title = "Community Service Article"
     body  = "community service, personal growth, and community impact"
+    lesson_prompt = ""
     try:
         # ── Title: try multiple selectors in priority order ───────────────────
         title_selectors = [
@@ -501,8 +503,8 @@ async def extract_article(page) -> tuple[str, str]:
             except Exception:
                 continue
 
-        # ── Body: JS evaluation with resilient multi-strategy extraction ──────
-        extracted_body = await page.evaluate('''() => {
+        # ── Body + Lesson Prompt: single JS evaluation pass ────────────────
+        result = await page.evaluate('''() => {
             const CLUTTER_WORDS = [
                 "time remaining", "navigation", "dashboard", "log out", "logout",
                 "reflection submitted", "submit", "next article", "great work",
@@ -511,18 +513,69 @@ async def extract_article(page) -> tuple[str, str]:
             ];
             const CLUTTER_TAGS = new Set(["button", "nav", "footer", "header", "script", "style", "noscript"]);
             const MIN_PARA_LEN = 40;
+            const GENERIC_PROMPTS = new Set([
+                "please share your thoughts on the article you just read.",
+                "what did you take away from this article?",
+                "write your reflection here",
+                "enter your response"
+            ]);
 
             function isClutter(el, text) {
                 if (CLUTTER_TAGS.has(el.tagName.toLowerCase())) return true;
                 if (el.closest("nav, footer, header, [role='navigation']")) return true;
                 const lower = text.toLowerCase();
-                for (let w of CLUTTER_WORDS) {
-                    if (lower.includes(w)) return true;
-                }
+                for (let w of CLUTTER_WORDS) { if (lower.includes(w)) return true; }
                 return false;
             }
 
-            // Strategy 1: explicit article/main/prose containers
+            function isGoodPrompt(text) {
+                if (!text || text.trim().length < 15) return false;
+                const lower = text.trim().toLowerCase();
+                for (let gp of GENERIC_PROMPTS) { if (lower.startsWith(gp)) return false; }
+                return (
+                    text.includes("?") ||
+                    lower.startsWith("describe") ||
+                    lower.startsWith("explain") ||
+                    lower.startsWith("how") ||
+                    lower.startsWith("what") ||
+                    lower.startsWith("why") ||
+                    lower.startsWith("reflect") ||
+                    lower.startsWith("think about") ||
+                    lower.startsWith("share") ||
+                    lower.startsWith("discuss")
+                );
+            }
+
+            // Strategy 1: find specific lesson prompt on article page
+            // Often appears near reflection/question sections with class or heading cues
+            let lessonPrompt = "";
+            const PROMPT_SELS = [
+                ".reflection-prompt", ".reflection-question", ".prompt",
+                ".question", "[class*='prompt']", "[class*='question']",
+                "blockquote", "h2", "h3", "h4"
+            ];
+            for (let sel of PROMPT_SELS) {
+                const els = Array.from(document.querySelectorAll(sel));
+                for (let el of els) {
+                    if (el.closest("nav, footer, header")) continue;
+                    const t = (el.innerText || "").trim();
+                    if (isGoodPrompt(t) && t.length < 400) { lessonPrompt = t; break; }
+                }
+                if (lessonPrompt) break;
+            }
+            // Also scan <p> tags for question-style prompts (catches inline prompts)
+            if (!lessonPrompt) {
+                const paras = Array.from(document.querySelectorAll("p"));
+                for (let el of paras) {
+                    if (el.closest("nav, footer, header")) continue;
+                    const t = (el.innerText || "").trim();
+                    if (isGoodPrompt(t) && t.length < 400 && t.includes("?")) {
+                        lessonPrompt = t; break;
+                    }
+                }
+            }
+
+            // Strategy 2: body extraction (multi-container)
             const CONTAINER_SELS = [
                 "article", "main", ".prose", ".article-body", ".lesson-content",
                 ".course-content", "#content", "[class*='content']", "[class*='article']",
@@ -536,13 +589,11 @@ async def extract_article(page) -> tuple[str, str]:
 
             let elements = [];
             if (container) {
-                elements = Array.from(container.querySelectorAll('p, h2, h3, h4, li'));
+                elements = Array.from(container.querySelectorAll("p, h2, h3, h4, li"));
                 if (elements.length === 0) elements = [container];
             }
-
-            // Strategy 2: fall back to all paragraphs on page
             if (elements.length === 0) {
-                elements = Array.from(document.querySelectorAll('p, li'));
+                elements = Array.from(document.querySelectorAll("p, li"));
             }
 
             const seen = new Set();
@@ -556,16 +607,21 @@ async def extract_article(page) -> tuple[str, str]:
                 texts.push(text);
                 if (texts.join("\\n\\n").length > 3500) break;
             }
-            return texts.join("\\n\\n");
+            return { body: texts.join("\\n\\n"), prompt: lessonPrompt };
         }''')
 
-        if extracted_body and len(extracted_body.strip()) > 80:
-            body = extracted_body[:3000]
+        if result.get("body") and len(result["body"].strip()) > 80:
+            body = result["body"][:3000]
         else:
             body = ""
+
+        if result.get("prompt"):
+            lesson_prompt = result["prompt"].strip()
+            log.info(f"   Lesson prompt found on article page: {lesson_prompt!r}")
+
     except Exception as e:
         log.warning(f"article extract: {e}")
-    return title, body
+    return title, body, lesson_prompt
 
 
 async def safe_goto(page, url: str, retries: int = 3) -> bool:
@@ -869,19 +925,23 @@ async def wait_for_timer(
 async def reading_phase(
     page, lesson: LessonEntry, hours_done: float, hours_today: float,
     hours_total: float, rs: Optional[RunState] = None,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str]:
+    """Returns (article_title, article_body, pre_reflection, lesson_prompt)."""
     log.info(f"📖 Reading: {lesson.title!r} — {lesson.url}")
     log_event("reading_start", lesson_url=lesson.url, lesson_title=lesson.title)
 
     if not await safe_goto(page, lesson.url):
         raise RuntimeError(f"Could not open reading page for {lesson.title!r}")
 
-    title, body = await extract_article(page)
+    title, body, lesson_prompt = await extract_article(page)
     log.info(f"   Article: {title!r}")
+    if not lesson_prompt:
+        lesson_prompt = f"What key lessons did you take away from reading '{title}'?"
+        log.info(f"   No specific prompt on article page — using title fallback")
 
     loop = asyncio.get_event_loop()
     agy_task = loop.run_in_executor(
-        None, call_agy, title, body, "What did you take away from this article?"
+        None, call_agy, title, body, lesson_prompt
     )
 
     secs = await get_timer(page)
@@ -892,12 +952,13 @@ async def reading_phase(
         log.info("   No reading timer")
 
     reflection = await agy_task
-    return title, body, reflection
+    return title, body, reflection, lesson_prompt
 
 
 async def reflect_phase(
     page, lesson: LessonEntry, art_title: str, art_body: str, pre_reflection: str,
     hours_done: float, hours_today: float, hours_total: float,
+    lesson_prompt: str = "",
     rs: Optional[RunState] = None,
 ) -> bool:
     reflect_url = lesson.url.rstrip("/") + "/reflect"
@@ -914,84 +975,17 @@ async def reflect_phase(
         log.info(f"   ✓ Already submitted: {art_title!r}")
         return True
 
-    prompt_text = ""
-    try:
-        prompt_text = await page.evaluate('''() => {
-            const GENERIC_LABELS = new Set([
-                "your reflection", "your reflection *", "reflection", "reflection *",
-                "reflection question", "reflection submitted", "submit reflection",
-                "time remaining", "required", "enter your response",
-                "write your reflection", "type your reflection here"
-            ]);
+    # Use the lesson-specific prompt extracted from the article page.
+    # The /reflect page only has a generic prompt; the real question is on the reading page.
+    if not lesson_prompt:
+        lesson_prompt = f"What key lessons and insights did you take away from reading '{art_title}'?"
+        log.info(f"   No lesson prompt passed in — using article-title fallback")
 
-            function isGoodPrompt(text) {
-                if (!text || text.trim().length < 15) return false;
-                const lower = text.trim().toLowerCase();
-                if (GENERIC_LABELS.has(lower)) return false;
-                // Must look like an actual question or instruction
-                return (
-                    text.includes("?") ||
-                    lower.startsWith("describe") ||
-                    lower.startsWith("explain") ||
-                    lower.startsWith("how") ||
-                    lower.startsWith("what") ||
-                    lower.startsWith("why") ||
-                    lower.startsWith("reflect") ||
-                    lower.startsWith("think about") ||
-                    lower.startsWith("share") ||
-                    lower.startsWith("discuss")
-                );
-            }
+    log.info(f"Reflection Prompt Question: {lesson_prompt!r}")
 
-            // Strategy 1: walk up from textarea to find nearby heading/label
-            const ta = document.querySelector("textarea, [contenteditable='true']");
-            if (ta) {
-                let node = ta.parentElement;
-                for (let i = 0; i < 6 && node; i++) {
-                    for (let sel of ["h1", "h2", "h3", "h4", "p.prompt", "p.question", ".prompt", ".question", "label"]) {
-                        const el = node.querySelector(sel);
-                        if (el) {
-                            const t = (el.innerText || "").trim();
-                            if (isGoodPrompt(t)) return t;
-                        }
-                    }
-                    node = node.parentElement;
-                }
-            }
-
-            // Strategy 2: scan known semantic selectors
-            const PROMPT_SELS = [
-                ".reflection-prompt", ".reflection-question", ".prompt",
-                ".question", "[class*='prompt']", "[class*='question']",
-                "blockquote", "h2", "h3", "h4", "p"
-            ];
-            for (let sel of PROMPT_SELS) {
-                const els = Array.from(document.querySelectorAll(sel));
-                for (let el of els) {
-                    if (el.closest("nav, footer, header")) continue;
-                    const t = (el.innerText || "").trim();
-                    if (isGoodPrompt(t)) return t;
-                }
-            }
-            return "";
-        }''')
-    except Exception as e:
-        log.debug(f"prompt scrape js error: {e}")
-
-    # Normalise and fallback
-    if prompt_text:
-        prompt_text = prompt_text.strip()
-    if not prompt_text or prompt_text.lower().rstrip(" *") in (
-        "your reflection", "reflection", "enter your response",
-        "write your reflection", "required"
-    ):
-        prompt_text = f"What key lessons and insights did you take away from reading '{art_title}'?"
-        log.info(f"   No specific prompt found — using article-title fallback prompt")
-
-    log.info(f"Reflection Prompt Question: {prompt_text!r}")
-
-    log.info("   Calling agy for reflection with exact prompt question...")
-    reflection = call_agy(art_title, art_body, prompt_text)
+    # Always re-call the LLM with the exact extracted prompt at reflect time
+    log.info("   Calling agy for reflection with exact lesson prompt...")
+    reflection = call_agy(art_title, art_body, lesson_prompt)
 
     log_event("reflection_generated", lesson_title=lesson.title,
               article_title=art_title, reflection=reflection,
@@ -1301,22 +1295,26 @@ async def process_lesson(
         "It discussed community impact, personal responsibility, and evidence-based approaches."
     )
     reflection = ""
+    lesson_prompt = ""
 
     if state == "needs_read":
-        art_title, art_body, reflection = await reading_phase(
+        art_title, art_body, reflection, lesson_prompt = await reading_phase(
             page, lesson, prog["done"], hours_today, prog["total"], rs
         )
     elif state == "needs_reflect":
         if await safe_goto(page, lesson.url):
-            t, b = await extract_article(page)
+            t, b, p = await extract_article(page)
             if t and t != "Community Service Article":
                 art_title, art_body = t, b
+            if p:
+                lesson_prompt = p
         log.info(f"   Reading already complete — going to reflect for {art_title!r}")
 
     prog_before = await get_progress(page)
     success = await reflect_phase(
         page, lesson, art_title, art_body, reflection,
-        prog_before["done"], hours_today, prog_before["total"], rs,
+        prog_before["done"], hours_today, prog_before["total"],
+        lesson_prompt=lesson_prompt, rs=rs,
     )
 
     prog_after = await get_progress(page)
