@@ -195,16 +195,36 @@ def set_terminal_title(text: str):
     sys.stderr.flush()
 
 
+def make_progress_bar(done: float, total: float, width: int = 10) -> str:
+    pct = done / total if total > 0 else 0
+    filled = int(pct * width)
+    return "█" * filled + "░" * (width - filled)
+
 def format_status_line(rs: RunState) -> str:
     remaining_today = max(0, DAILY_HOUR_LIMIT - rs.hours_today)
     timer_str = f"{rs.timer_secs//60}:{rs.timer_secs%60:02d}" if rs.timer_secs > 0 else "00:00"
     title = rs.title[:42] if rs.title else "…"
     pos = f"#{rs.queue_pos}/{rs.queue_total}" if rs.queue_total else "#?"
     done_str = f"done:{rs.catalog_done}+{rs.session_done}"
+    
+    C_RESET = "\033[0m"
+    C_PHASE = "\033[1;36m" if "WAIT" not in rs.phase else "\033[1;35m"
+    C_TIMER = "\033[1;33m"
+    C_STATS = "\033[1;97m"
+    C_GREEN = "\033[1;32m"
+    
+    prog_pct = int((rs.hours_done / rs.hours_total) * 100) if rs.hours_total > 0 else 0
+    bar = make_progress_bar(rs.hours_done, rs.hours_total)
+    
     return (
-        f"TFC {done_str} · {pos} {rs.phase} {timer_str} · {title} · "
-        f"today {rs.hours_today:.1f}/{DAILY_HOUR_LIMIT:.0f}h · "
-        f"all {rs.hours_done:.1f}/{rs.hours_total:.0f}h · left {remaining_today:.1f}h"
+        f"TFC {done_str} · {pos} "
+        f"{C_PHASE}{rs.phase}{C_RESET} "
+        f"{C_TIMER}{timer_str}{C_RESET} · "
+        f"{title} · "
+        f"{C_STATS}today {rs.hours_today:.1f}/{DAILY_HOUR_LIMIT:.0f}h{C_RESET} · "
+        f"{C_GREEN}[{bar}] {prog_pct}%{C_RESET} "
+        f"({rs.hours_done:.1f}/{rs.hours_total:.0f}h) · "
+        f"left {remaining_today:.1f}h"
     )
 
 
@@ -220,9 +240,10 @@ def live_status(phase: str, timer_secs: int, lesson_title: str,
     state.hours_today = hours_today
     state.hours_total = hours_total
     line = format_status_line(state)
-    sys.stderr.write("\r" + line)
+    sys.stderr.write("\033[2K\r" + line)
     sys.stderr.flush()
-    set_terminal_title(line)
+    clean_line = re.sub(r'\033\[[0-9;]*m', '', line)
+    set_terminal_title(clean_line)
 
 
 # ── agy reflection via CLI pipe ───────────────────────────────────────────────
@@ -915,9 +936,9 @@ async def get_user_profile(page) -> dict:
 
 def log_user_profile(user_info: dict, prog: dict):
     """Log structured user information banner upon login."""
-    log.info("=" * 60)
-    log.info("👤 USER ACCOUNT PROFILE & EDIT PROFILE DETAILS")
-    log.info("=" * 60)
+    log.info("╭────────────────────────────────────────────────────────╮")
+    log.info("│ 👤 USER ACCOUNT PROFILE & EDIT PROFILE DETAILS         │")
+    log.info("├────────────────────────────────────────────────────────┤")
 
     display_order = [
         "FULL NAME", "Full Name",
@@ -937,20 +958,20 @@ def log_user_profile(user_info: dict, prog: dict):
         if key in user_info and key not in logged_keys:
             val = user_info[key]
             if val:
-                log.info(f"• {key:<30}: {val}")
+                log.info(f"│ {key:<30}: {val}")
                 logged_keys.add(key)
 
     for k, v in user_info.items():
         if k not in logged_keys and v:
-            log.info(f"• {k:<30}: {v}")
+            log.info(f"│ {k:<30}: {v}")
             logged_keys.add(k)
 
     if prog:
         pct = f"({prog.get('percent', 0)}% Complete)" if 'percent' in prog else ""
-        log.info(f"• {'OVERALL PROGRESS':<30}: {prog.get('done', 0)}h / {prog.get('total', 75)}h total {pct}")
-        log.info(f"• {'HOURS REMAINING':<30}: {prog.get('remaining', 0):.1f}h")
+        log.info(f"│ {'OVERALL PROGRESS':<30}: {prog.get('done', 0)}h / {prog.get('total', 75)}h total {pct}")
+        log.info(f"│ {'HOURS REMAINING':<30}: {prog.get('remaining', 0):.1f}h")
 
-    log.info("=" * 60)
+    log.info("╰────────────────────────────────────────────────────────╯")
     log_event("user_profile_loaded", **user_info)
 
 
@@ -965,14 +986,15 @@ async def wait_for_daily_reset(page, rs: RunState):
 
     h_str = f"{secs_until_midnight // 3600}h {(secs_until_midnight % 3600) // 60}m {secs_until_midnight % 60}s"
 
-    log.info("=" * 60)
-    log.info("⛔ DAILY LIMIT REACHED ON PLATFORM (8.0h / 8.0h max for today)")
-    log.info(f"📅 Today's Logged Hours: {rs.hours_today:.1f}h")
-    log.info(f"📊 Overall Progress: {rs.hours_done:.1f}h / {rs.hours_total:.1f}h total")
-    log.info("🔔 USER NOTIFICATION: Daily limit reached. Bot will wait for reset and resume automatically.")
-    log.info(f"⏰ Next reset estimated at local midnight ({tomorrow.strftime('%Y-%m-%d 12:00:00 AM')} local time).")
-    log.info(f"⏳ Time until reset: {h_str}")
-    log.info("=" * 60)
+    log.info("╭────────────────────────────────────────────────────────╮")
+    log.info("│ ⛔ DAILY LIMIT REACHED ON PLATFORM (8.0h / 8.0h max)   │")
+    log.info("├────────────────────────────────────────────────────────┤")
+    log.info(f"│ 📅 Today's Logged Hours: {rs.hours_today:.1f}h")
+    log.info(f"│ 📊 Overall Progress: {rs.hours_done:.1f}h / {rs.hours_total:.1f}h total")
+    log.info("│ 🔔 USER NOTIFICATION: Limit reached. Bot will wait...  │")
+    log.info(f"│ ⏰ Next reset estimated at: {tomorrow.strftime('%Y-%m-%d 12:00:00 AM')}")
+    log.info(f"│ ⏳ Time until reset: {h_str}")
+    log.info("╰────────────────────────────────────────────────────────╯")
 
     log_event("daily_limit_wait_start", seconds_until_midnight=secs_until_midnight, reset_target=tomorrow.isoformat())
 
@@ -1074,10 +1096,11 @@ async def process_lesson(
 async def main():
     global RUN_STATE
 
-    log.info("=" * 60)
-    log.info(f"TFC Bot v4  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log.info("Catalog discovery | state verify | terminal title status | agy reflections")
-    log.info("=" * 60)
+    log.info("╭────────────────────────────────────────────────────────╮")
+    log.info(f"│ TFC Bot v4  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S'):<31} │")
+    log.info("├────────────────────────────────────────────────────────┤")
+    log.info("│ Catalog discovery | state verify | agy reflections     │")
+    log.info("╰────────────────────────────────────────────────────────╯")
 
     log_event("bot_start", version=4)
 
