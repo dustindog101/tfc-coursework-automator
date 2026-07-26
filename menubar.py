@@ -55,6 +55,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.watchdog_enabled = True   # Watchdog active by default
         self.user_paused = False       # Tracks if user manually paused bot
         self.last_crash_time = 0.0
+        self.display_mode = "auto"     # auto, timers, progress, full, minimal
 
         # ── 1. Status ──────────────────────────────────────────
         self.item_status = rumps.MenuItem("⚙️ Initializing...", callback=None)
@@ -107,29 +108,13 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_set_headed = rumps.MenuItem("👁️ Browser Mode Toggle: Headless", callback=self.toggle_headed)
         self.item_set_autostart = rumps.MenuItem("🚀 macOS Start on Login: OFF", callback=self.toggle_autostart)
         self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart Toggle: ON", callback=self.toggle_watchdog)
-        
-        self.menu_title_style = rumps.MenuItem("🎨 Menu Bar Title Style ▾")
-        self.item_mode_auto = rumps.MenuItem("Auto (Default)", callback=self.set_display_mode_auto)
-        self.item_mode_timers = rumps.MenuItem("Timers Focus Mode", callback=self.set_display_mode_timers)
-        self.item_mode_progress = rumps.MenuItem("Progress Focus Mode", callback=self.set_display_mode_progress)
-        self.item_mode_full = rumps.MenuItem("Full Detailed View", callback=self.set_display_mode_full)
-        self.item_mode_minimal = rumps.MenuItem("Minimal Status Badge", callback=self.set_display_mode_minimal)
-        
-        self.menu_title_style.update([
-            self.item_mode_auto,
-            self.item_mode_timers,
-            self.item_mode_progress,
-            self.item_mode_full,
-            self.item_mode_minimal
-        ])
-        self.item_mode_auto.state = 1
-        
+        self.item_set_display = rumps.MenuItem("📺 Title Display Mode: Auto", callback=self.cycle_display_mode)
         self.item_set_env = rumps.MenuItem("✏️ Edit Credentials (.env)", callback=self.edit_env)
         self.menu_settings.update([
             self.item_set_headed,
             self.item_set_autostart,
             self.item_set_watchdog,
-            self.menu_title_style,
+            self.item_set_display,
             None,
             self.item_set_env
         ])
@@ -163,27 +148,6 @@ class TFCCourseworkMenuApp(rumps.App):
 
         # Auto-launch bot process in Headless mode by default
         self.ensure_bot_running_on_start()
-
-    def set_display_mode(self, mode, item):
-        self.display_mode = mode
-        for i in [self.item_mode_auto, self.item_mode_timers, self.item_mode_progress, self.item_mode_full, self.item_mode_minimal]:
-            i.state = 0
-        item.state = 1
-
-    def set_display_mode_auto(self, sender):
-        self.set_display_mode("auto", sender)
-
-    def set_display_mode_timers(self, sender):
-        self.set_display_mode("timers", sender)
-
-    def set_display_mode_progress(self, sender):
-        self.set_display_mode("progress", sender)
-
-    def set_display_mode_full(self, sender):
-        self.set_display_mode("full", sender)
-
-    def set_display_mode_minimal(self, sender):
-        self.set_display_mode("minimal", sender)
 
     def is_bot_running(self):
         """Check if python3 run_courses.py is currently executing."""
@@ -322,6 +286,15 @@ class TFCCourseworkMenuApp(rumps.App):
         else:
             self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart Toggle: OFF"
             rumps.notification("TFC Settings", "Watchdog Disabled", "Automatic crash restart disabled.")
+
+    def cycle_display_mode(self, _):
+        """Cycle through menu bar title display modes."""
+        modes = ["auto", "timers", "progress", "full", "minimal"]
+        idx = modes.index(self.display_mode)
+        self.display_mode = modes[(idx + 1) % len(modes)]
+        self.item_set_display.title = f"📺 Title Display Mode: {self.display_mode.capitalize()}"
+        rumps.notification("TFC Settings", "Display Mode Changed", f"Menu bar title will now use {self.display_mode} layout.")
+        self.update_state(None) # Force UI refresh
 
     def edit_env(self, _):
         """Open .env file in default text editor."""
@@ -515,6 +488,19 @@ class TFCCourseworkMenuApp(rumps.App):
         s_rem = diff_s % 60
         calc_reset_str = f"{h_rem:02d}h {m_rem:02d}m"
         calc_reset_str_secs = f"{h_rem:02d}h {m_rem:02d}m {s_rem:02d}s"
+
+        # Make sure done and total are floats for formatting
+        try:
+            done_f = float(done)
+            total_f = float(total)
+        except (ValueError, TypeError):
+            done_f = 0.0
+            total_f = 0.0
+
+        timer_part = ""
+        prog_part = f"{done_f:.1f}/{total_f:g}h"
+        icon = ""
+        status_text = ""
 
         new_state_id = ""
         active_icon = "⏸️"
