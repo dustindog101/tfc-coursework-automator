@@ -558,6 +558,22 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception:
                 pass
 
+        is_resuming = False
+        if events:
+            last_limit_wait = -1
+            last_resume = -1
+            for idx, ev in enumerate(events):
+                ev_name = ev.get("event")
+                if ev_name == "daily_limit_wait_start":
+                    last_limit_wait = idx
+                elif ev_name in ("daily_limit_reset_detected", "reading_start", "lesson_start", "bot_start"):
+                    last_resume = idx
+            
+            if last_resume > last_limit_wait and last_limit_wait != -1:
+                is_limit_wait = False
+                is_retrying_after_midnight = False
+                is_resuming = True
+
         # Calculate time until local midnight (12:00 AM local time)
         now = datetime.now()
         midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -617,9 +633,10 @@ class TFCCourseworkMenuApp(rumps.App):
             elif submit_timer_str != "N/A":
                 icon = "✍️"
                 timer_part = f"Submit {submit_timer_str}"
-            status_text = "Active"
+            
+            status_text = "Resuming..." if (is_resuming and read_timer_str == "N/A" and submit_timer_str == "N/A") else "Active"
                 
-            self.item_status.title = "🟢 Active"
+            self.item_status.title = f"🟢 {status_text}"
             self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h)"
             
         else:
