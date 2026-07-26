@@ -451,6 +451,52 @@ def log_reflection_generated(
     )
 
 
+_SOURCE_PRIORITY = {"agy": 3, "opencode": 2, "fallback": 1, "": 0}
+
+
+def refresh_reflection_before_submit(
+    art_title: str, art_body: str, lesson_prompt: str,
+    current: str, current_source: str,
+) -> tuple[str, str]:
+    """Last-chance agy/opencode retry right before submit (quota may have reopened)."""
+    log.info("   Pre-submit LLM recheck (agy/opencode may have reopened)...")
+    new_text, new_source = call_agy(art_title, art_body, lesson_prompt)
+    if _SOURCE_PRIORITY.get(new_source, 0) > _SOURCE_PRIORITY.get(current_source, 0):
+        log.info(
+            f"   Pre-submit upgrade: {current_source or 'none'} -> {new_source} "
+            f"({len(new_text)} chars)"
+        )
+        return new_text, new_source
+    if current_source in ("agy", "opencode"):
+        log.info(f"   Pre-submit recheck unavailable — keeping {current_source} draft")
+        return current, current_source
+    log.info("   Pre-submit recheck still fallback only — keeping current draft")
+    return current, current_source
+
+
+async def fill_reflection_textarea(page, reflection: str) -> int:
+    """Fill the reflection textarea and return final character count."""
+    for sel in ["#reflection-response", "textarea[placeholder*='minimum' i]", "textarea"]:
+        try:
+            ta = page.locator(sel).first
+            if await ta.count() > 0 and await ta.is_visible():
+                await ta.click()
+                await page.wait_for_timeout(400)
+                await ta.fill(reflection)
+                await page.wait_for_timeout(400)
+                filled_len = len(await ta.input_value())
+                log.info(f"   Filled textarea: {filled_len} chars")
+                if filled_len < REFLECTION_MIN:
+                    pad = " this was genuinely useful info and i plan to think about it more."
+                    await ta.fill((reflection + pad)[:REFLECTION_MAX])
+                    filled_len = len(await ta.input_value())
+                    log.info(f"   Padded to {filled_len} chars")
+                return filled_len
+        except Exception as e:
+            log.debug(f"   textarea {sel}: {e}")
+    return 0
+
+
 def default_reflect_prompt(title: str) -> str:
     return f"What key lessons and insights did you take away from reading '{title}'?"
 
@@ -992,26 +1038,7 @@ async def reflect_phase(
 
     log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
 
-    filled_len = 0
-    for sel in ["#reflection-response", "textarea[placeholder*='minimum' i]", "textarea"]:
-        try:
-            ta = page.locator(sel).first
-            if await ta.count() > 0 and await ta.is_visible():
-                await ta.click()
-                await page.wait_for_timeout(400)
-                await ta.fill(reflection)
-                await page.wait_for_timeout(400)
-                filled_len = len(await ta.input_value())
-                log.info(f"   Filled textarea: {filled_len} chars")
-
-                if filled_len < REFLECTION_MIN:
-                    pad = " this was genuinely useful info and i plan to think about it more."
-                    await ta.fill((reflection + pad)[:REFLECTION_MAX])
-                    filled_len = len(await ta.input_value())
-                    log.info(f"   Padded to {filled_len} chars")
-                break
-        except Exception as e:
-            log.debug(f"   textarea {sel}: {e}")
+    filled_len = await fill_reflection_textarea(page, reflection)
 
     try:
         stars = page.locator("button:has-text('★')")
@@ -1029,6 +1056,16 @@ async def reflect_phase(
     if secs > 0:
         log.info(f"   Reflect timer: {secs//60}:{secs%60:02d}")
         await wait_for_timer(page, "REFLECT", art_title, hours_done, hours_today, hours_total, rs)
+
+    loop = asyncio.get_event_loop()
+    refreshed, refreshed_source = await loop.run_in_executor(
+        None, refresh_reflection_before_submit,
+        art_title, art_body, lesson_prompt, reflection, reflection_source,
+    )
+    if (refreshed, refreshed_source) != (reflection, reflection_source):
+        reflection, reflection_source = refreshed, refreshed_source
+        log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
+        filled_len = await fill_reflection_textarea(page, reflection)
 
     submit_sel = "button:has-text('Submit Reflection'), button.btn-cta[type='submit']"
     for attempt in range(20):

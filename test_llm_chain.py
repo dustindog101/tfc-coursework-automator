@@ -42,6 +42,22 @@ class TestLLMChain(unittest.TestCase):
         prompt = rc.default_reflect_prompt("Addiction Basics")
         self.assertIn("Addiction Basics", prompt)
 
+    def test_pre_submit_upgrade_from_fallback(self):
+        with patch.object(rc, "call_agy", return_value=("opencode text here" + "x" * 80, "opencode")):
+            text, source = rc.refresh_reflection_before_submit(
+                "Title", "Body", "Prompt?", "old fallback text" + "x" * 80, "fallback",
+            )
+        self.assertEqual(source, "opencode")
+        self.assertTrue(text.startswith("opencode text here"))
+
+    def test_pre_submit_keeps_agy_when_recheck_fails(self):
+        with patch.object(rc, "call_agy", return_value=(rc._FALLBACKS[0], "fallback")):
+            text, source = rc.refresh_reflection_before_submit(
+                "Title", "Body", "Prompt?", "agy draft text" + "x" * 80, "agy",
+            )
+        self.assertEqual(source, "agy")
+        self.assertTrue(text.startswith("agy draft text"))
+
     @patch("run_courses.subprocess.run")
     def test_run_llm_prompt_uses_agy_first(self, mock_run):
         mock_run.return_value.returncode = 0
