@@ -1,7 +1,9 @@
 <div align="center">
-  <img src="tfc_hero_banner.jpg" alt="TFC Automator Hero Banner" width="800"/>
+  <img src="tfc_app_logo.jpg" alt="TFC Automator Logo" width="160" style="border-radius: 28px; margin-bottom: 12px;"/>
 
   # 🚀 Foundation of Change Coursework Automator
+
+  <img src="tfc_github_banner.jpg" alt="TFC Automator Hero Banner" width="850" style="border-radius: 12px; margin: 16px 0;"/>
 
   <p align="center">
     <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=for-the-badge&logo=python" alt="Python 3.10+"></a>
