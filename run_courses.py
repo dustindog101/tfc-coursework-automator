@@ -1167,6 +1167,41 @@ async def process_lesson(
         except Exception as e:
             log.error(f"Failed to update completed courses: {e}")
 
+        bot_completed_path = os.path.join(ROOT_DIR, "bot_completed_courses.json")
+        try:
+            with open(bot_completed_path, "r", encoding="utf-8") as f:
+                b_data = json.load(f)
+                b_courses = b_data.get("courses", [])
+        except Exception:
+            b_courses = []
+            
+        found = False
+        for c in b_courses:
+            if isinstance(c, dict) and c.get("title") == lesson.title:
+                found = True
+                break
+            elif c == lesson.title:
+                found = True
+                break
+                
+        if not found:
+            b_courses.append({"title": lesson.title, "ts": datetime.now().isoformat()})
+            
+        try:
+            with open(bot_completed_path, "w", encoding="utf-8") as f:
+                json.dump({"count": len(b_courses), "courses": b_courses, "updated": datetime.now().isoformat()}, f, indent=2)
+            log_event("bot_completed_courses_snapshot", count=len(b_courses), courses=b_courses)
+            
+            log.info("╭────────────────────────────────────────────────────────╮")
+            log.info(f"│ 🤖 BOT COMPLETED COURSES ({len(b_courses):<28}) │")
+            log.info("├────────────────────────────────────────────────────────┤")
+            for i, c in enumerate(b_courses, 1):
+                t = c.get("title") if isinstance(c, dict) else c
+                log.info(f"│ {i}. {t}")
+            log.info("╰────────────────────────────────────────────────────────╯")
+        except Exception as e:
+            log.error(f"Failed to update bot completed courses: {e}")
+
     return success, hours_gained
 
 

@@ -65,8 +65,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_status = rumps.MenuItem("⚙️ Initializing...", callback=None)
         
         # ── 1.5. Completed Courses ──────────────────────────────
-        self.menu_completed = rumps.MenuItem("🎓 Completed Courses")
-        self.menu_completed.add(rumps.MenuItem("No completed courses yet"))
+        self.menu_bot_completed = rumps.MenuItem("🤖 Bot Completed Courses")
+        self.menu_all_completed = rumps.MenuItem("🌐 All Site Completed Courses")
 
         # ── 2. Coursework Queue ──────────────────────────────────────────────
         self.menu_queue = rumps.MenuItem("📚 Coursework Queue & Lesson")
@@ -151,7 +151,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu = [
             self.item_status,
             None,
-            self.menu_completed,
+            self.menu_bot_completed,
+            self.menu_all_completed,
             self.menu_queue,
             self.menu_timers,
             self.menu_reflection,
@@ -526,30 +527,60 @@ class TFCCourseworkMenuApp(rumps.App):
                     self.menu_history.add(rumps.MenuItem(h))
                     
         # 1.5 Update Completed Courses UI
-        completed_path = os.path.join(ROOT_DIR, "completed_courses.json")
-        completed_courses = []
-        completed_count = 0
-        if os.path.exists(completed_path):
+        # Bot completed
+        bot_path = os.path.join(ROOT_DIR, "bot_completed_courses.json")
+        bot_courses = []
+        bot_count = 0
+        if os.path.exists(bot_path):
             try:
-                with open(completed_path, "r", encoding="utf-8") as f:
-                    comp_data = json.load(f)
-                    completed_courses = comp_data.get("courses", [])
-                    completed_count = comp_data.get("count", 0)
+                with open(bot_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    bot_courses = data.get("courses", [])
+                    bot_count = data.get("count", 0)
             except Exception:
                 pass
-
-        done_f = float(self.progress.get("done", 0.0))
-        total_f = float(self.progress.get("total", 0.0))
-        
-        self.menu_completed.title = f"🎓 Completed Courses ({completed_count})"
-        self.menu_completed.clear()
-        if completed_count > 0:
-            self.menu_completed.add(rumps.MenuItem(f"✅ Total Completed: {completed_count} courses ({done_f:.1f} / {total_f:.0f}h)"))
-            self.menu_completed.add(None)
-            for idx, course_title in enumerate(completed_courses, 1):
-                self.menu_completed.add(rumps.MenuItem(f"{idx}. {course_title}"))
+                
+        self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_count})"
+        self.menu_bot_completed.clear()
+        if bot_count > 0:
+            self.menu_bot_completed.add(rumps.MenuItem(f"✅ Finished by Bot: {bot_count}"))
+            self.menu_bot_completed.add(None)
+            for idx, c in enumerate(bot_courses, 1):
+                if isinstance(c, dict):
+                    t = c.get("title", "Unknown")
+                    ts = format_local_time(c.get("ts", ""))
+                    ts_str = f" [{ts}]" if ts else ""
+                else:
+                    t = c
+                    ts_str = ""
+                self.menu_bot_completed.add(rumps.MenuItem(f"{idx}. {t}{ts_str}"))
         else:
-            self.menu_completed.add(rumps.MenuItem("No completed courses yet"))
+            self.menu_bot_completed.add(rumps.MenuItem("No courses completed by bot yet"))
+
+        # All completed
+        all_path = os.path.join(ROOT_DIR, "completed_courses.json")
+        all_courses = []
+        all_count = 0
+        if os.path.exists(all_path):
+            try:
+                with open(all_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    all_courses = data.get("courses", [])
+                    all_count = data.get("count", 0)
+            except Exception:
+                pass
+                
+        self.menu_all_completed.title = f"🌐 All Site Completed Courses ({all_count})"
+        self.menu_all_completed.clear()
+        if all_count > 0:
+            done_f = float(self.progress.get("done", 0.0))
+            total_f = float(self.progress.get("total", 0.0))
+            self.menu_all_completed.add(rumps.MenuItem(f"✅ Total Completed: {all_count} ({done_f:.1f} / {total_f:.0f}h)"))
+            self.menu_all_completed.add(None)
+            for idx, c in enumerate(all_courses, 1):
+                self.menu_all_completed.add(rumps.MenuItem(f"{idx}. {c}"))
+        else:
+            self.menu_all_completed.add(rumps.MenuItem("No site completed courses yet"))
 
         # 2. Update Profile & Progress UI
         name = self.profile.get("FULL NAME") or self.profile.get("name") or "Unknown"
