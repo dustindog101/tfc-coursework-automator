@@ -25,7 +25,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -302,9 +304,48 @@ def _strip_em_dash(t: str) -> str:
     return t.replace("\u2014", ",").replace("\u2013", ",").replace("—", ",").replace("–", ",")
 
 
+OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/mimo-v2.5-free")
+OPENCODE_USER_MSG = "Write only the reflection text, no preamble."
+
+
+def _clean_llm_text(text: str) -> str:
+    text = text.strip().strip('"\'')
+    text = _strip_em_dash(text)
+    text = re.sub(r'^```.*?\n', '', text, flags=re.MULTILINE).strip()
+    return text
+
+
+def _extract_prose(text: str) -> str:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    prose = next(
+        (
+            l for l in reversed(lines)
+            if len(l) >= REFLECTION_MIN
+            and not l.startswith("{")
+            and not l.startswith("timestamp")
+        ),
+        text,
+    )
+    return prose[:REFLECTION_MAX]
+
+
+def _build_opencode_cmd(system_prompt: str) -> tuple[list[str], Optional[str]]:
+    """
+    Build opencode argv. Always attach prompt via -f after the user message.
+    Prompts often start with '-' (bullet rules) which breaks positional parsing.
+    """
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    tmp.write(system_prompt)
+    tmp.close()
+    return [
+        "opencode", "run", "-m", OPENCODE_MODEL, "--auto",
+        OPENCODE_USER_MSG, "-f", tmp.name,
+    ], tmp.name
+
+
 def _run_llm_prompt(system_prompt: str) -> Optional[str]:
     """
-    Try agy first, then opencode, then return None.
+    Try agy → opencode (mimo) → Gemini API → return None.
     Returns clean reflection text or None on all failures.
     """
     # ── 1. Try agy ────────────────────────────────────────────────────────────
@@ -314,18 +355,15 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
             capture_output=True, text=True, timeout=60, cwd=ROOT_DIR,
         )
         if result.returncode == 0:
-            text = result.stdout.strip().strip('"\'')
-            text = _strip_em_dash(text)
-            text = re.sub(r'^```.*?\n', '', text, flags=re.MULTILINE).strip()
+            text = _extract_prose(_clean_llm_text(result.stdout))
             if len(text) >= REFLECTION_MIN:
                 log.info(f"agy reflection ({len(text)} chars): {text!r}")
                 return text
-            else:
-                log.warning(f"agy output too short ({len(text)} chars): {text!r}")
+            log.warning(f"agy output too short ({len(text)} chars): {text!r}")
         else:
             stderr = result.stderr[:300]
             if any(k in stderr.lower() for k in ["quota", "rate", "limit", "429", "exhausted"]):
-                log.warning(f"agy quota/rate limit hit — trying opencode fallback")
+                log.warning("agy quota/rate limit hit — trying opencode fallback")
             else:
                 log.warning(f"agy exit {result.returncode}: {stderr}")
     except subprocess.TimeoutExpired:
@@ -335,40 +373,68 @@ def _run_llm_prompt(system_prompt: str) -> Optional[str]:
     except Exception as e:
         log.warning(f"agy error: {e} — trying opencode fallback")
 
-    # ── 2. Try opencode ───────────────────────────────────────────────────────
+    # ── 2. Try opencode (mimo) ────────────────────────────────────────────────
+    tmp_path = None
     try:
-        # opencode run [message..] — pass full prompt as single element; subprocess handles quoting
+        cmd, tmp_path = _build_opencode_cmd(system_prompt)
         result = subprocess.run(
-            ["opencode", "run", system_prompt],
-            capture_output=True, text=True, timeout=120, cwd=ROOT_DIR,
+            cmd, capture_output=True, text=True, timeout=120, cwd=ROOT_DIR,
         )
-
         if result.returncode == 0:
-            # opencode outputs the raw response text on stdout
-            text = result.stdout.strip().strip('"\'')
-            text = _strip_em_dash(text)
-            text = re.sub(r'^```.*?\n', '', text, flags=re.MULTILINE).strip()
-            # opencode may include session headers — take last paragraph only
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            # Find the longest line that looks like actual prose
-            prose = next(
-                (l for l in reversed(lines) if len(l) >= REFLECTION_MIN and not l.startswith("{") and not l.startswith("timestamp")),
-                text
-            )
-            prose = prose[:REFLECTION_MAX]
+            prose = _extract_prose(_clean_llm_text(result.stdout))
             if len(prose) >= REFLECTION_MIN:
                 log.info(f"opencode reflection ({len(prose)} chars): {prose!r}")
                 return prose
-            else:
-                log.warning(f"opencode output too short ({len(prose)} chars)")
+            log.warning(f"opencode output too short ({len(prose)} chars)")
         else:
             log.warning(f"opencode exit {result.returncode}: {result.stderr[:200]}")
     except subprocess.TimeoutExpired:
-        log.warning("opencode timed out (90s)")
+        log.warning("opencode timed out (120s)")
     except FileNotFoundError:
         log.warning("opencode not found in PATH")
     except Exception as e:
         log.warning(f"opencode error: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    # ── 3. Try Gemini API directly (HTTP fallback) ────────────────────────────
+    try:
+        api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
+        if not api_key:
+            agy_cfg = os.path.expanduser("~/.config/agy/config.json")
+            if os.path.exists(agy_cfg):
+                with open(agy_cfg, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("key", "")
+        if api_key:
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-2.0-flash:generateContent?key={api_key}"
+            )
+            payload = json.dumps({
+                "contents": [{"parts": [{"text": system_prompt}]}],
+                "generationConfig": {"temperature": 0.8, "maxOutputTokens": 300},
+            }).encode()
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            prose = _extract_prose(_clean_llm_text(text))
+            if len(prose) >= REFLECTION_MIN:
+                log.info(f"gemini-api reflection ({len(prose)} chars): {prose!r}")
+                return prose
+            log.warning(f"gemini-api output too short ({len(prose)} chars)")
+        else:
+            log.warning("No GEMINI_API_KEY found — skipping Gemini API fallback")
+    except Exception as e:
+        log.warning(f"Gemini API fallback error: {e}")
 
     return None
 
@@ -398,7 +464,7 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> str:
     # ── 3. Hardcoded fallback ─────────────────────────────────────────────────
     idx = int(time.time() / 3600) % len(_FALLBACKS)
     r = _FALLBACKS[idx]
-    log.warning(f"Both agy and opencode failed — using hardcoded fallback [{idx}] ({len(r)} chars)")
+    log.warning(f"agy, opencode, and gemini-api failed — using hardcoded fallback [{idx}] ({len(r)} chars)")
     return r
 
 
@@ -1344,13 +1410,26 @@ async def process_lesson(
             page, lesson, prog["done"], hours_today, prog["total"], rs
         )
     elif state == "needs_reflect":
-        if await safe_goto(page, lesson.url):
+        # Navigate to article page to get body + lesson prompt.
+        # Note: if reading is complete the site may redirect to /reflect automatically.
+        # We always explicitly navigate to the base lesson URL (not /reflect) to get real content.
+        article_url = lesson.url.rstrip("/").replace("/reflect", "")
+        if await safe_goto(page, article_url):
+            # Wait briefly for any redirect to settle
+            await page.wait_for_timeout(1500)
+            # If page redirected to /reflect, extract_article returns empty.
+            # Check current URL and log it.
+            current_url = page.url
+            if "/reflect" in current_url:
+                log.info(f"   Article page redirected to /reflect — body/prompt unavailable from redirect")
             t, b, p = await extract_article(page)
             if t and t != "Community Service Article":
                 art_title, art_body = t, b
             if p:
                 lesson_prompt = p
+                log.info(f"   Extracted lesson prompt: {lesson_prompt!r}")
         log.info(f"   Reading already complete — going to reflect for {art_title!r}")
+
 
     prog_before = await get_progress(page)
     success = await reflect_phase(
