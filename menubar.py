@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from collections import deque
 import rumps
 
+import socket
+
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 EVENTS_FILE = os.path.join(ROOT_DIR, "events.jsonl")
 LOG_FILE = os.path.join(ROOT_DIR, "automation.log")
@@ -21,6 +23,18 @@ COMPLETED_COURSES_FILE = os.path.join(ROOT_DIR, "completed_courses.json")
 SCRIPT_PATH = os.path.join(ROOT_DIR, "run_courses.py")
 ENV_FILE = os.path.join(ROOT_DIR, ".env")
 LAUNCH_AGENT_PATH = os.path.expanduser("~/Library/LaunchAgents/com.tfc.automator.plist")
+
+_SINGLE_INSTANCE_LOCK_SOCKET = None
+
+def enforce_single_instance():
+    """Ensure only ONE instance of menubar.py runs simultaneously on the system."""
+    global _SINGLE_INSTANCE_LOCK_SOCKET
+    try:
+        _SINGLE_INSTANCE_LOCK_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _SINGLE_INSTANCE_LOCK_SOCKET.bind(("127.0.0.1", 49153))
+    except socket.error:
+        sys.stderr.write("⚠️ Another instance of TFC Menu Bar is already running. Exiting.\n")
+        sys.exit(0)
 
 
 def format_local_time(ts_iso_str: str) -> str:
@@ -859,5 +873,6 @@ class TFCCourseworkMenuApp(rumps.App):
 
 
 if __name__ == "__main__":
+    enforce_single_instance()
     app = TFCCourseworkMenuApp()
     app.run()
