@@ -93,9 +93,11 @@ class TFCCourseworkMenuApp(rumps.App):
         
         # ── 4.5. Completed Courses ───────────────────────────────────────────
         self.menu_completed_courses = rumps.MenuItem("🎓 Completed Courses")
-        self.item_bot_completed = rumps.MenuItem("🤖 Bot Completed Courses (0)")
-        self.item_site_completed = rumps.MenuItem("🌐 All Site Completed (0)")
-        self.menu_completed_courses.update([self.item_bot_completed, self.item_site_completed])
+        self.menu_bot_completed = rumps.MenuItem("🤖 Bot Completed Courses (0)")
+        self.menu_bot_completed.add(rumps.MenuItem("No courses completed by bot yet"))
+        self.menu_site_completed = rumps.MenuItem("🌐 All Site Completed (0)")
+        self.menu_site_completed.add(rumps.MenuItem("No courses loaded yet"))
+        self.menu_completed_courses.update([self.menu_bot_completed, self.menu_site_completed])
         
         # ── 5. User Profile & Court Proof ──────────────────────────────────
         self.menu_profile = rumps.MenuItem("👤 User Profile & Court Proof")
@@ -151,15 +153,10 @@ class TFCCourseworkMenuApp(rumps.App):
         self.menu = [
             self.item_status,
             None,
-            self.menu_bot_completed,
-            self.menu_all_completed,
+            self.menu_completed_courses,
             self.menu_queue,
             self.menu_timers,
             self.menu_reflection,
-            
-            # ── Completed Courses ────────────────────────────────────────────────
-            self.menu_completed_courses,
-            
             self.menu_profile,
             self.menu_history,
             self.menu_settings,
@@ -541,7 +538,11 @@ class TFCCourseworkMenuApp(rumps.App):
                 pass
                 
         self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_count})"
-        self.menu_bot_completed.clear()
+        try:
+            self.menu_bot_completed.clear()
+        except Exception:
+            pass
+            
         if bot_count > 0:
             self.menu_bot_completed.add(rumps.MenuItem(f"✅ Finished by Bot: {bot_count}"))
             self.menu_bot_completed.add(None)
@@ -570,17 +571,21 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception:
                 pass
                 
-        self.menu_all_completed.title = f"🌐 All Site Completed Courses ({all_count})"
-        self.menu_all_completed.clear()
+        self.menu_site_completed.title = f"🌐 All Site Completed Courses ({all_count})"
+        try:
+            self.menu_site_completed.clear()
+        except Exception:
+            pass
+            
         if all_count > 0:
             done_f = float(self.progress.get("done", 0.0))
             total_f = float(self.progress.get("total", 0.0))
-            self.menu_all_completed.add(rumps.MenuItem(f"✅ Total Completed: {all_count} ({done_f:.1f} / {total_f:.0f}h)"))
-            self.menu_all_completed.add(None)
-            for idx, c in enumerate(all_courses, 1):
-                self.menu_all_completed.add(rumps.MenuItem(f"{idx}. {c}"))
+            self.menu_site_completed.add(rumps.MenuItem(f"✅ Total Completed: {all_count} ({done_f:.1f} / {total_f:.0f}h)"))
+            self.menu_site_completed.add(None)
+            for idx, course_title in enumerate(all_courses, 1):
+                self.menu_site_completed.add(rumps.MenuItem(f"{idx}. {course_title}"))
         else:
-            self.menu_all_completed.add(rumps.MenuItem("No site completed courses yet"))
+            self.menu_site_completed.add(rumps.MenuItem("No completed courses loaded yet"))
 
         # 2. Update Profile & Progress UI
         name = self.profile.get("FULL NAME") or self.profile.get("name") or "Unknown"
@@ -754,8 +759,8 @@ class TFCCourseworkMenuApp(rumps.App):
                 pass
                 
         site_completed = getattr(self, "site_completed", 0)
-        self.item_bot_completed.title = f"🤖 Bot Completed Courses ({bot_completed_count})"
-        self.item_site_completed.title = f"🌐 All Site Completed ({site_completed})"
+        self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_completed_count})"
+        self.menu_site_completed.title = f"🌐 All Site Completed ({site_completed})"
 
         # Apply Display Mode Title
         prog_part = f"{done_f:.1f}/{total_f:g}h"
