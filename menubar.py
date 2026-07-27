@@ -523,11 +523,15 @@ class TFCCourseworkMenuApp(rumps.App):
                         submit_timer_str = fmt_time
                     break
                         
-            # Get today's hours if available
+            # Get today's hours if available (date matching today)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            self.hours_today = 0.0
             for ev in reversed(events):
                 if "hours_today" in ev:
-                    self.hours_today = float(ev["hours_today"])
-                    break
+                    ev_date = ev.get("date") or (ev.get("ts", "")[:10] if "ts" in ev else "")
+                    if ev_date == today_str:
+                        self.hours_today = float(ev["hours_today"])
+                        break
                         
             # Event history items formatted in 12-hour local time
             history_items = []
@@ -761,9 +765,11 @@ class TFCCourseworkMenuApp(rumps.App):
             hrs_today_f = 0.0
 
         # Master is_limit_wait determination:
-        # True if hours_today >= 8.0 or log_limit_wait is True or event_limit_wait is True.
-        # Fixes bug where logging bot_start cleared is_limit_wait when hours_today >= 8.0 or [LIMIT_WAIT] active.
-        if hrs_today_f >= 8.0 or log_limit_wait or event_limit_wait:
+        # Active reading/reflection timer or [READ]/[REFLECT] log overrides limit wait
+        if read_timer_str != "N/A" or submit_timer_str != "N/A":
+            is_limit_wait = False
+            is_retrying_after_midnight = False
+        elif hrs_today_f >= 8.0 or log_limit_wait or event_limit_wait:
             is_limit_wait = True
         else:
             is_limit_wait = False
@@ -798,6 +804,25 @@ class TFCCourseworkMenuApp(rumps.App):
         daily_filled = max(0, min(10, daily_filled))
         daily_bar = "█" * daily_filled + "░" * (10 - daily_filled)
 
+        # Update Submenu Timer Titles
+        if read_timer_str != "N/A":
+            self.item_read_timer.title = f"• Reading Timer: {read_timer_str}"
+        else:
+            self.item_read_timer.title = "• Reading Timer: Inactive"
+
+        if submit_timer_str != "N/A":
+            self.item_submit_timer.title = f"• Reflection Submit Timer: {submit_timer_str}"
+        else:
+            self.item_submit_timer.title = "• Reflection Submit Timer: Inactive"
+
+        if is_limit_wait or is_retrying_after_midnight:
+            if is_retrying_after_midnight and diff_s == 0:
+                self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
+            else:
+                self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM)"
+        else:
+            self.item_limit_timer.title = "• Midnight Reset Timer: Inactive"
+
         timer_part = ""
         icon = ""
         status_text = ""
@@ -809,12 +834,10 @@ class TFCCourseworkMenuApp(rumps.App):
                 icon = "🔄"
                 timer_part = "2m Retry"
                 status_text = "Retrying Reset"
-                self.item_limit_timer.title = "• Midnight Reset Timer: Retrying every 2 minutes..."
             else:
                 icon = "🌙"
                 timer_part = calc_reset_str
                 status_text = "Limit Wait"
-                self.item_limit_timer.title = f"• Midnight Reset Timer: {calc_reset_str_secs} (12:00 AM)"
                 
             self.item_status.title = f"🌙 {status_text}"
             self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h - Limit Hit)"
