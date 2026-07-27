@@ -568,8 +568,49 @@ class TFCCourseworkMenuApp(rumps.App):
                     history_items.append(f"{t_prefix}🌅 Midnight Reset Detected")
                 elif event_name == "bot_start":
                     history_items.append(f"{t_prefix}🚀 Bot Engine Started")
+
+            # Fallback: fill history from automation.log if events are sparse
+            if len(history_items) < 5 and os.path.exists(LOG_FILE):
+                try:
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        for line in deque(f, maxlen=200):
+                            if len(history_items) >= 10:
+                                break
+                            line_str = line.strip()
+                            if not line_str:
+                                continue
+                            ts_match = re.search(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", line_str)
+                            t_prefix = f"[{format_local_time(ts_match.group(1))}] " if ts_match else ""
+                            
+                            if "Reading: " in line_str:
+                                m = re.search(r"Reading:\s*'([^']+)'", line_str)
+                                title = m.group(1)[:25] if m else "Lesson"
+                                item = f"{t_prefix}📖 Reading: {title}"
+                                if item not in history_items:
+                                    history_items.append(item)
+                            elif "Submitted reflection" in line_str or "Submitted: " in line_str:
+                                m = re.search(r"Submitted[^:]*:\s*'([^']+)'", line_str)
+                                title = m.group(1)[:25] if m else "Lesson"
+                                item = f"{t_prefix}📤 Submitted Reflection: {title}"
+                                if item not in history_items:
+                                    history_items.append(item)
+                            elif "DAILY LIMIT REACHED" in line_str or "LIMIT REACHED" in line_str:
+                                item = f"{t_prefix}⛔ Daily Limit Hit (8.0h)"
+                                if item not in history_items:
+                                    history_items.append(item)
+                            elif "Limit reset confirmed" in line_str:
+                                item = f"{t_prefix}🌅 Midnight Reset Detected"
+                                if item not in history_items:
+                                    history_items.append(item)
+                            elif "TFC Bot v" in line_str:
+                                item = f"{t_prefix}🚀 Bot Engine Started"
+                                if item not in history_items:
+                                    history_items.append(item)
+                except Exception:
+                    pass
                     
-            if history_items:
+            if history_items and history_items != getattr(self, '_cached_history_items', None):
+                self._cached_history_items = list(history_items)
                 self.safe_clear_menu(self.menu_history)
                 for h in history_items:
                     self.menu_history.add(rumps.MenuItem(h))
@@ -616,22 +657,24 @@ class TFCCourseworkMenuApp(rumps.App):
 
         bot_count = max(bot_count, len(bot_courses))
         self.menu_bot_completed.title = f"🤖 Bot Completed Courses ({bot_count})"
-        self.safe_clear_menu(self.menu_bot_completed)
-            
-        if bot_count > 0:
-            self.menu_bot_completed.add(rumps.MenuItem(f"✅ Finished by Bot: {bot_count}"))
-            self.menu_bot_completed.add(None)
-            for idx, c in enumerate(bot_courses, 1):
-                if isinstance(c, dict):
-                    t = c.get("title", "Unknown")
-                    ts = format_local_time(c.get("ts", ""))
-                    ts_str = f" [{ts}]" if ts else ""
-                else:
-                    t = str(c)
-                    ts_str = ""
-                self.menu_bot_completed.add(rumps.MenuItem(f"{idx}. {t}{ts_str}"))
-        else:
-            self.menu_bot_completed.add(rumps.MenuItem("No courses completed by bot yet"))
+        
+        if bot_courses != getattr(self, '_cached_bot_courses', None):
+            self._cached_bot_courses = list(bot_courses)
+            self.safe_clear_menu(self.menu_bot_completed)
+            if bot_count > 0:
+                self.menu_bot_completed.add(rumps.MenuItem(f"✅ Finished by Bot: {bot_count}"))
+                self.menu_bot_completed.add(None)
+                for idx, c in enumerate(bot_courses, 1):
+                    if isinstance(c, dict):
+                        t = c.get("title", "Unknown")
+                        ts = format_local_time(c.get("ts", ""))
+                        ts_str = f" [{ts}]" if ts else ""
+                    else:
+                        t = str(c)
+                        ts_str = ""
+                    self.menu_bot_completed.add(rumps.MenuItem(f"{idx}. {t}{ts_str}"))
+            else:
+                self.menu_bot_completed.add(rumps.MenuItem("No courses completed by bot yet"))
 
         # All completed on site
         all_path = os.path.join(ROOT_DIR, "completed_courses.json")
@@ -653,18 +696,20 @@ class TFCCourseworkMenuApp(rumps.App):
         all_count = max(all_count, len(all_courses))
         self.menu_completed_courses.title = f"🎓 Completed Courses on Site ({all_count})"
         self.menu_site_completed.title = f"🌐 All Site Completed ({all_count})"
-        self.safe_clear_menu(self.menu_site_completed)
-            
-        if all_count > 0:
-            done_f = float(self.progress.get("done", 0.0))
-            total_f = float(self.progress.get("total", 0.0))
-            self.menu_site_completed.add(rumps.MenuItem(f"✅ Total Completed: {all_count} ({done_f:.1f} / {total_f:.0f}h)"))
-            self.menu_site_completed.add(None)
-            for idx, course_title in enumerate(all_courses, 1):
-                t = course_title.get("title", str(course_title)) if isinstance(course_title, dict) else str(course_title)
-                self.menu_site_completed.add(rumps.MenuItem(f"{idx}. {t}"))
-        else:
-            self.menu_site_completed.add(rumps.MenuItem("No completed courses loaded yet"))
+        
+        if all_courses != getattr(self, '_cached_site_courses', None):
+            self._cached_site_courses = list(all_courses)
+            self.safe_clear_menu(self.menu_site_completed)
+            if all_count > 0:
+                done_f = float(self.progress.get("done", 0.0))
+                total_f = float(self.progress.get("total", 0.0))
+                self.menu_site_completed.add(rumps.MenuItem(f"✅ Total Completed: {all_count} ({done_f:.1f} / {total_f:.0f}h)"))
+                self.menu_site_completed.add(None)
+                for idx, course_title in enumerate(all_courses, 1):
+                    t = course_title.get("title", str(course_title)) if isinstance(course_title, dict) else str(course_title)
+                    self.menu_site_completed.add(rumps.MenuItem(f"{idx}. {t}"))
+            else:
+                self.menu_site_completed.add(rumps.MenuItem("No completed courses loaded yet"))
 
         # 2. Update Profile & Progress UI
         name = self.profile.get("FULL NAME") or self.profile.get("name") or "amanuel hailie"
