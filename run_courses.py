@@ -357,7 +357,7 @@ def _run_llm_prompt(system_prompt: str) -> Optional[tuple[str, str]]:
     # ── 1. Try agy ────────────────────────────────────────────────────────────
     try:
         result = subprocess.run(
-            ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)"],
+            ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)", "--effort", "low"],
             capture_output=True, text=True, timeout=60, cwd=ROOT_DIR,
         )
         if result.returncode == 0:
