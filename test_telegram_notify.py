@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -40,6 +41,37 @@ class TestLiveState(unittest.TestCase):
         state = tg._parse_live_state(events)
         self.assertEqual(state["phase"], "reading")
         self.assertEqual(state["lesson_title"], "New Lesson")
+
+    def test_limit_wait_clears_stale_lesson_fields(self):
+        events = [
+            {"event": "reflect_start", "lesson_title": "Old", "article_title": "Art"},
+            {"event": "reflection_generated", "lesson_title": "Old", "reflection": "draft"},
+            {"event": "daily_limit_hit", "hours_today": 8.0, "hours_remaining": 0.0},
+            {
+                "event": "daily_limit_wait_start",
+                "hours_today": 8.0,
+                "seconds_until_midnight": 3600,
+                "reset_target": (datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                                 + timedelta(days=1)).isoformat(),
+                "ts": datetime.now().isoformat(),
+            },
+        ]
+        state = tg._parse_live_state(events)
+        self.assertEqual(state["phase"], "limit_wait")
+        self.assertIsNone(state["lesson_title"])
+        self.assertIsNone(state["reflection"])
+        with patch.object(tg, "is_bot_running", return_value=True):
+            text = tg.build_status_text()
+        self.assertNotIn("Old", text)
+        self.assertIn("limit reached", text.lower())
+
+    def test_live_reset_counts_down(self):
+        target = (datetime.now() + timedelta(hours=2)).isoformat()
+        events = [{"event": "daily_limit_wait_start", "reset_target": target}]
+        secs = tg._live_reset_seconds(events)
+        self.assertIsNotNone(secs)
+        self.assertGreater(secs, 3500)
+        self.assertLess(secs, 7500)
 
     def test_limit_wait_uses_limit_hours_not_stale_timer(self):
         events = [

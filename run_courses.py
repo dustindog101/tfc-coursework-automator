@@ -1657,7 +1657,13 @@ async def wait_for_daily_reset(page, rs: RunState):
     log.info(f"│ ⏳ Time until reset: {h_str}")
     log.info("╰────────────────────────────────────────────────────────╯")
 
-    log_event("daily_limit_wait_start", seconds_until_midnight=secs_until_midnight, reset_target=tomorrow.isoformat())
+    log_event(
+        "daily_limit_wait_start",
+        seconds_until_midnight=secs_until_midnight,
+        reset_target=tomorrow.isoformat(),
+        hours_today=rs.hours_today,
+        hours_done=rs.hours_done,
+    )
 
     start_time = time.time()
     last_notify_time = 0.0

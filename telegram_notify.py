@@ -206,10 +206,12 @@ def _api_request(method: str, payload: dict) -> Optional[dict]:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
-            detail = exc.read().decode("utf-8", errors="replace")[:200]
+            detail = exc.read().decode("utf-8", errors="replace")
         except Exception:
             detail = str(exc)
-        _log_throttled(f"Telegram API {method} failed: {detail}")
+        if method == "editMessageText" and exc.code == 400 and "message is not modified" in detail.lower():
+            return {"ok": True}
+        _log_throttled(f"Telegram API {method} failed: {detail[:200]}")
     except Exception as exc:
         _log_throttled(f"Telegram API {method} error: {exc}")
     return None
@@ -358,6 +360,53 @@ def _truncate_reflection(text: str, max_len: int = _REFLECTION_PREVIEW_MAX) -> s
     return text[: max_len - 1].rstrip() + "…"
 
 
+def _live_reset_seconds(events: list[dict]) -> Optional[int]:
+    """Countdown to midnight from the newest limit-wait event (live, not stale)."""
+    for ev in reversed(events):
+        if ev.get("event") != "daily_limit_wait_start":
+            continue
+        target = ev.get("reset_target")
+        if target:
+            try:
+                end = datetime.fromisoformat(str(target))
+                return max(0, int(end.timestamp() - time.time()))
+            except Exception:
+                pass
+        secs = ev.get("seconds_until_midnight")
+        ts = ev.get("ts")
+        if secs is not None and ts:
+            try:
+                started = datetime.fromisoformat(ts).timestamp()
+                return max(0, int(secs) - int(time.time() - started))
+            except Exception:
+                pass
+        if secs is not None:
+            return max(0, int(secs))
+    return None
+
+
+def _hours_from_limit_hit(events: list[dict]) -> tuple[float, float]:
+    for ev in reversed(events):
+        if ev.get("event") == "daily_limit_hit":
+            return (
+                float(ev.get("hours_today", DAILY_HOUR_LIMIT)),
+                float(ev.get("hours_remaining", 0.0)),
+            )
+    return DAILY_HOUR_LIMIT, 0.0
+
+
+def _infer_lesson_phase(record: dict) -> str:
+    """Pick reading vs reflect for reflection_generated updates."""
+    title = record.get("lesson_title")
+    for ev in reversed(_tail_events()):
+        e = ev.get("event")
+        if e == "reflect_start" and ev.get("lesson_title") == title:
+            return "reflect"
+        if e in ("reading_start", "lesson_start") and ev.get("lesson_title") == title:
+            return "reading"
+    return "reading"
+
+
 def _parse_live_state(events: list[dict]) -> dict[str, Any]:
     """Phase + hours from the same newest anchor — never mix stale timer_sync with limit wait."""
     state: dict[str, Any] = {
@@ -419,25 +468,22 @@ def _parse_live_state(events: list[dict]) -> dict[str, Any]:
             state["hours_total"] = float(ev.get("total", 75))
             break
 
-    for ev in reversed(events):
-        if ev.get("event") == "reflection_generated":
-            state["reflection"] = ev.get("reflection")
-            state["reflection_source"] = ev.get("source")
-            state["article_title"] = ev.get("article_title") or state["article_title"]
-            if not state["lesson_title"]:
-                state["lesson_title"] = ev.get("lesson_title")
-            break
-
     phase = state["phase"]
 
-    if phase == "limit_wait" and anchor:
-        state["hours_today"] = float(
-            anchor.get("hours_today", DAILY_HOUR_LIMIT)
-        )
-        state["hours_remaining_today"] = float(
-            anchor.get("hours_remaining", 0.0)
-        )
-        state["timer_secs"] = state.get("limit_reset_secs")
+    if phase == "limit_wait":
+        hit_hours, hit_rem = _hours_from_limit_hit(events)
+        if anchor and anchor.get("hours_today") is not None:
+            state["hours_today"] = float(anchor["hours_today"])
+        else:
+            state["hours_today"] = hit_hours
+        state["hours_remaining_today"] = hit_rem
+        reset = _live_reset_seconds(events)
+        state["limit_reset_secs"] = reset
+        state["timer_secs"] = reset
+        state["lesson_title"] = None
+        state["article_title"] = None
+        state["reflection"] = None
+        state["reflection_source"] = None
     elif phase in ("reading", "reflect", "starting", "submitted"):
         for ev in reversed(events):
             if ev.get("event") != "timer_sync":
@@ -455,8 +501,19 @@ def _parse_live_state(events: list[dict]) -> dict[str, Any]:
                 state["hours_today"] = float(anchor["hours_today"])
             if anchor.get("hours_done") is not None and state["hours_done"] <= 0:
                 state["hours_done"] = float(anchor["hours_done"])
+            if anchor.get("lesson_title"):
+                state["lesson_title"] = anchor.get("lesson_title")
+            if anchor.get("article_title"):
+                state["article_title"] = anchor.get("article_title")
         state["hours_remaining_today"] = max(0.0, DAILY_HOUR_LIMIT - state["hours_today"])
         state["at_daily_limit"] = state["hours_today"] >= DAILY_HOUR_LIMIT - 0.05
+        for ev in reversed(events):
+            if ev.get("event") == "reflection_generated":
+                state["reflection"] = ev.get("reflection")
+                state["reflection_source"] = ev.get("source")
+                if not state["article_title"]:
+                    state["article_title"] = ev.get("article_title")
+                break
     elif anchor and anchor.get("hours_today") is not None:
         state["hours_today"] = float(anchor["hours_today"])
         state["hours_remaining_today"] = max(0.0, DAILY_HOUR_LIMIT - state["hours_today"])
@@ -592,7 +649,9 @@ def on_event(record: dict) -> None:
         return
 
     if event == "reflection_generated":
-        _enqueue_lesson_update(_build_lesson_card_from_record(record, phase="reading"))
+        _enqueue_lesson_update(
+            _build_lesson_card_from_record(record, phase=_infer_lesson_phase(record)),
+        )
         return
 
     if event == "reflect_start":
@@ -602,6 +661,23 @@ def on_event(record: dict) -> None:
     if event == "reflect_submitted":
         card = _build_lesson_card_from_record(record, phase="submitted")
         _enqueue_lesson_update(card)
+        return
+
+    if event == "daily_limit_hit":
+        _clear_lesson_msg()
+        return
+
+    if event == "daily_limit_wait_start":
+        _clear_lesson_msg()
+        hours = float(record.get("hours_today", DAILY_HOUR_LIMIT))
+        reset = record.get("seconds_until_midnight")
+        lines = [
+            _daily_line(hours, at_limit=True),
+            "<b>Status</b>  Bot resting until midnight",
+        ]
+        if reset:
+            lines.append(f"<b>Reset in</b>  {_esc(_format_timer_secs(int(reset)))}")
+        notify(_card("🌙 Daily Limit — Waiting", lines))
         return
 
     if event == "lesson_complete":
@@ -698,9 +774,13 @@ def build_status_text() -> str:
     phase = live["phase"]
     lines.append(f"<b>Phase</b>  {_phase_label(phase)}")
 
-    if live.get("lesson_title") and phase != "limit_wait":
+    if live.get("lesson_title") and phase in ("reading", "reflect", "starting", "submitted"):
         lines.append(f"<b>Lesson</b>  {_esc(live['lesson_title'])}")
-    if live.get("article_title") and live["article_title"] != live.get("lesson_title"):
+    if (
+        live.get("article_title")
+        and phase in ("reading", "reflect", "submitted")
+        and live["article_title"] != live.get("lesson_title")
+    ):
         lines.append(f"<b>Article</b>  {_esc(live['article_title'])}")
 
     hours_today = float(live.get("hours_today", 0))

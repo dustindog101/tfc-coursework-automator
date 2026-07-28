@@ -53,7 +53,7 @@ The menubar toggle reflects real state (reads `.env` token + linked chat).
 | `/stats` | Overall hours, remaining, ETA, today's session, bot completions |
 | `/help` | Full command reference |
 
-`/status` and `/stats` re-read `events.jsonl` on every request. Phase and daily hours always come from the **same newest event** — you will never see "6.1 h" and "limit reached" at the same time.
+`/status` and `/stats` re-read `events.jsonl` on every request. Phase and daily hours always come from the **same newest event** — you will never see mismatched hours vs phase (e.g. `6.1 h` while limit-waiting). During limit wait, stale lesson/article lines are hidden and the reset timer counts down live to midnight.
 
 ## Example messages
 
