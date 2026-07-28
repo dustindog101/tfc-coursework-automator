@@ -114,9 +114,13 @@ Get coursework updates on your phone without staring at the terminal.
 | Event | Notification |
 | :--- | :--- |
 | Bot started / stopped | Engine online or session summary |
-| New article | Title when a lesson begins |
-| Lesson complete | Hours gained, today’s total, overall progress |
-| Daily limit | 8h cap reached — bot waits for midnight |
+| **Live lesson message** | **One message per article** — edits in place as the bot progresses |
+| → Reading | Phase + today's hour bar (`3.2 / 8 h`) |
+| → Reflection draft | Appends the AI-generated reflection text |
+| → Reflection | Phase switches to ✍️ Reflection |
+| → Submitted | Marks reflection submitted ✓ |
+| → Lesson complete | Final summary with hours gained |
+| Daily limit | 8h cap with today's bar — only when actually waiting |
 | Errors | Lesson failure with retry note |
 
 ### Commands (live on demand)
@@ -126,7 +130,7 @@ Message your bot anytime:
 | Command | Description |
 | :--- | :--- |
 | `/start` | Link this chat (auto-saves your chat ID) |
-| `/status` | Current article, phase, timer, progress |
+| `/status` | Live phase (Reading / Reflection / Limit wait), today's hours + time left, timer, draft |
 | `/stats` | Total hours, bar chart, today’s work, ETA, completions |
 | `/help` | Command list |
 
@@ -143,6 +147,8 @@ TELEGRAM_ENABLED=1
 3. Start the automator: `./run_menubar.sh` or `./run_cli.sh`
 4. Open Telegram → your bot → send **`/start`**
 5. Toggle push on/off: **Menubar → Settings → Telegram Notifications**
+
+`/status` always matches reality: phase and today's hours come from the same newest event (e.g. `6.1 / 8 h (1.9 h left)` while reading, or `8.0 / 8 h — limit reached` only when actually waiting for midnight).
 
 > **Security:** Never commit your token. `telegram_config.json` (chat ID) is gitignored. Revoke and regenerate the token in BotFather if it is ever exposed.
 

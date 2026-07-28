@@ -7,6 +7,7 @@ automation.log
 bot.pid
 telegram_config.json
 telegram_settings.json
+telegram_lesson_msg.json
 events.jsonl
 *.jsonl
 

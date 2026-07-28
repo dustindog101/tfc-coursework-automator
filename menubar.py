@@ -160,6 +160,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self._watchdog_restart_times: list[float] = []
         self._watchdog_backoff_logged = False
         self._watchdog_armed = False
+        self._telegram_ui_ts = 0.0
         self.display_mode = "auto"     # auto, timers, progress, full, minimal
         self._read_timer_end = 0.0
         self._reflect_timer_end = 0.0
@@ -514,28 +515,34 @@ class TFCCourseworkMenuApp(rumps.App):
         try:
             import telegram_notify
             telegram_notify.ensure_settings_file()
-            on = telegram_notify.is_enabled()
+            self.item_set_telegram.title = telegram_notify.menubar_label()
         except Exception:
-            on = False
-        self.item_set_telegram.title = (
-            "📱 Telegram Notifications: ON" if on else "📱 Telegram Notifications: OFF"
-        )
+            self.item_set_telegram.title = "📱 Telegram: Unavailable"
 
     def toggle_telegram(self, _):
         """Enable or disable Telegram push notifications."""
         try:
             import telegram_notify
             telegram_notify.ensure_settings_file()
+            if not telegram_notify.is_configured():
+                rumps.alert(
+                    "Telegram not configured",
+                    "Add TELEGRAM_BOT_TOKEN and TELEGRAM_ENABLED=1 to .env, then restart the bot.",
+                )
+                return
             new_state = not telegram_notify.is_enabled()
             telegram_notify.set_enabled(new_state)
             self.sync_telegram_ui()
             if new_state:
-                rumps.notification(
-                    "TFC Settings", "Telegram ON 📱",
-                    "Push notifications enabled. Message /start to your bot if not linked yet.",
-                )
+                hint = "Message /start to your bot if not linked yet."
+                if telegram_notify.is_linked():
+                    hint = "Push notifications enabled."
+                rumps.notification("TFC Settings", "Telegram ON 📱", hint)
             else:
-                rumps.notification("TFC Settings", "Telegram OFF", "Push notifications disabled.")
+                rumps.notification(
+                    "TFC Settings", "Telegram OFF",
+                    "Push disabled. /status and /stats still work while the bot is running.",
+                )
         except Exception as e:
             rumps.alert(f"Telegram settings error: {e}")
 
@@ -687,6 +694,11 @@ class TFCCourseworkMenuApp(rumps.App):
         """Polled every 1 second: monitors runner, watchdog, events.jsonl & automation.log."""
         bot_active = self.is_bot_running()
         self.update_toggle_button()
+
+        now_ts = time.time()
+        if now_ts - self._telegram_ui_ts >= 15.0:
+            self._telegram_ui_ts = now_ts
+            self.sync_telegram_ui()
         
         # Watchdog: auto-restart on crash only (not after manual stop)
         in_start_grace = (

@@ -1262,7 +1262,8 @@ async def reading_phase(
 ) -> tuple[str, str, str, str, str]:
     """Returns (article_title, article_body, pre_reflection, lesson_prompt, reflection_source)."""
     log.info(f"📖 Reading: {lesson.title!r} — {lesson.url}")
-    log_event("reading_start", lesson_url=lesson.url, lesson_title=lesson.title)
+    log_event("reading_start", lesson_url=lesson.url, lesson_title=lesson.title,
+              hours_today=hours_today, hours_done=hours_done)
 
     if not await safe_goto(page, lesson.url):
         raise RuntimeError(f"Could not open reading page for {lesson.title!r}")
@@ -1302,7 +1303,7 @@ async def reflect_phase(
     reflect_url = lesson.url.rstrip("/") + "/reflect"
     log.info(f"✍️  Reflect: {art_title!r} — {reflect_url}")
     log_event("reflect_start", lesson_url=lesson.url, lesson_title=lesson.title,
-              article_title=art_title)
+              article_title=art_title, hours_today=hours_today, hours_done=hours_done)
 
     if not await safe_goto(page, reflect_url):
         log.error(f"Could not open reflect page for {lesson.title!r}")

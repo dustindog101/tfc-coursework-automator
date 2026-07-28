@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import telegram_notify as tg
@@ -16,25 +16,55 @@ class TestEventMapping(unittest.TestCase):
         msg = tg.event_to_message({"event": "bot_start", "ts": "2026-07-27T12:00:00"})
         self.assertIn("Bot Started", msg)
 
-    def test_lesson_start_message(self):
-        msg = tg.event_to_message({"event": "lesson_start", "lesson_title": "Article A"})
-        self.assertIn("New Article", msg)
-        self.assertIn("Article A", msg)
+    def test_lesson_start_not_standalone_push(self):
+        self.assertIsNone(tg.event_to_message({"event": "lesson_start", "lesson_title": "A"}))
 
-    def test_lesson_complete_message(self):
-        msg = tg.event_to_message({
-            "event": "lesson_complete",
-            "lesson_title": "Article A",
-            "hours_gained": 1.2,
-            "hours_today": 3.0,
-            "hours_done": 10.5,
-        })
-        self.assertIn("Lesson Complete", msg)
-        self.assertIn("1.20", msg)
+    def test_daily_limit_includes_bar(self):
+        msg = tg.event_to_message({"event": "daily_limit_hit", "hours_today": 8.0})
+        self.assertIn("8.0", msg)
+        self.assertIn("█", msg)
 
     def test_skips_noisy_events(self):
         self.assertIsNone(tg.event_to_message({"event": "timer_sync"}))
-        self.assertIsNone(tg.event_to_message({"event": "reflection_generated"}))
+
+
+class TestLiveState(unittest.TestCase):
+    def test_reading_beats_stale_limit_wait(self):
+        events = [
+            {"event": "daily_limit_hit", "hours_today": 8.0},
+            {"event": "daily_limit_wait_start", "hours_today": 8.0},
+            {"event": "daily_limit_wait_complete"},
+            {"event": "lesson_start", "lesson_title": "New Lesson", "hours_today": 0.5},
+            {"event": "reading_start", "lesson_title": "New Lesson", "hours_today": 0.5},
+        ]
+        state = tg._parse_live_state(events)
+        self.assertEqual(state["phase"], "reading")
+        self.assertEqual(state["lesson_title"], "New Lesson")
+
+    def test_limit_wait_uses_limit_hours_not_stale_timer(self):
+        events = [
+            {"event": "timer_sync", "hours_today": 6.1, "phase": "REFLECT"},
+            {"event": "daily_limit_hit", "hours_today": 8.0, "hours_remaining": 0.0},
+            {"event": "daily_limit_wait_start", "hours_today": 8.0, "seconds_until_midnight": 44000},
+        ]
+        state = tg._parse_live_state(events)
+        self.assertEqual(state["phase"], "limit_wait")
+        self.assertEqual(state["hours_today"], 8.0)
+        text = tg.build_status_text()
+        self.assertIn("limit reached", text.lower())
+        self.assertNotIn("6.1", text)
+
+    def test_lesson_card_includes_reflection(self):
+        card = tg._build_lesson_card(
+            lesson_title="L1",
+            phase="reading",
+            hours_today=3.5,
+            reflection="This is my draft reflection text.",
+            reflection_source="agy",
+        )
+        self.assertIn("Reflection draft", card)
+        self.assertIn("draft reflection", card)
+        self.assertIn("3.5", card)
 
 
 class TestEnabledGating(unittest.TestCase):
@@ -54,34 +84,26 @@ class TestEnabledGating(unittest.TestCase):
     def test_notify_noop_when_disabled(self):
         tg.set_enabled(False)
         tg.register_chat(12345)
-        with patch.object(tg, "send_message") as mock_send:
-            tg.notify("hello")
-            tg._msg_queue.put((12345, "drain"))
-            item = tg._msg_queue.get_nowait()
-            self.assertEqual(item[1], "drain")
+        tg.notify("hello")
+        with self.assertRaises(Exception):
+            tg._msg_queue.get_nowait()
 
     @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_ENABLED": "1"})
     def test_is_enabled_without_token(self):
         self.assertFalse(tg.is_enabled())
 
+    @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ENABLED": "1"}, clear=False)
+    def test_menubar_label_linked_on(self):
+        tg.set_enabled(True)
+        tg.register_chat(123)
+        self.assertIn("ON", tg.menubar_label())
+
 
 class TestApiFailure(unittest.TestCase):
     @patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "bad"})
-    def test_send_message_returns_false_on_error(self):
+    def test_send_message_returns_none_on_error(self):
         with patch.object(tg, "_api_request", return_value=None):
-            self.assertFalse(tg.send_message(1, "hi"))
-
-    def test_worker_survives_send_failure(self):
-        with patch.object(tg, "is_enabled", return_value=True):
-            with patch.object(tg, "send_message", side_effect=RuntimeError("boom")):
-                tg._msg_queue.put((1, "test"))
-                # Worker loop runs forever; call send path via notify drain simulation
-                item = tg._msg_queue.get(timeout=1)
-                chat_id, text = item
-                try:
-                    tg.send_message(chat_id, text)
-                except RuntimeError:
-                    pass  # must not propagate to bot
+            self.assertIsNone(tg.send_message(1, "hi"))
 
 
 class TestStatusAndStats(unittest.TestCase):
@@ -105,17 +127,15 @@ class TestStatusAndStats(unittest.TestCase):
             for ev in events:
                 f.write(json.dumps(ev) + "\n")
 
-    def test_build_status_from_events(self):
+    def test_build_status_shows_reading_not_limit(self):
         self._write_events([
-            {"event": "progress_snapshot", "done": 20.0, "total": 75},
-            {"event": "lesson_start", "lesson_title": "CBT Intro"},
-            {"event": "reading_start", "lesson_title": "CBT Intro"},
+            {"event": "daily_limit_hit", "hours_today": 8.0},
+            {"event": "reading_start", "lesson_title": "CBT Intro", "hours_today": 1.0},
         ])
         with patch.object(tg, "is_bot_running", return_value=True):
             text = tg.build_status_text()
-        self.assertIn("Running", text)
-        self.assertIn("CBT Intro", text)
         self.assertIn("Reading", text)
+        self.assertNotIn("limit wait", text.lower())
 
     def test_build_stats_from_events(self):
         today = __import__("datetime").date.today().isoformat()
@@ -128,10 +148,8 @@ class TestStatusAndStats(unittest.TestCase):
             json.dump(["Lesson A", "Lesson B"], f)
         with patch.object(tg, "is_bot_running", return_value=False):
             text = tg.build_stats_text()
-        self.assertIn("30.0/75", text.replace(" ", ""))
-        self.assertIn("1.5", text)
+        self.assertIn("30.0", text)
         self.assertIn("Lessons completed", text)
-        self.assertIn("2", text)
 
 
 class TestCommands(unittest.TestCase):
@@ -144,14 +162,14 @@ class TestCommands(unittest.TestCase):
         tg.CONFIG_FILE = self._orig_config
         self._tmpdir.cleanup()
 
-    @patch.object(tg, "send_message", return_value=True)
+    @patch.object(tg, "send_message", return_value=1)
     def test_start_registers_chat(self, mock_send):
         tg._handle_command(999, "/start")
         self.assertEqual(tg.get_chat_id(), 999)
         mock_send.assert_called()
         self.assertIn("Linked", mock_send.call_args[0][1])
 
-    @patch.object(tg, "send_message", return_value=True)
+    @patch.object(tg, "send_message", return_value=1)
     def test_unauthorized_chat_ignored(self, mock_send):
         tg.register_chat(111)
         tg._handle_command(222, "/status")

@@ -19,62 +19,75 @@ You should receive a welcome message with the command list.
 
 ## Push notifications
 
-Formatted HTML messages are sent when:
+### Live lesson message (one per article)
 
-- The bot **starts** or **stops**
-- A **new article** begins
-- A **lesson completes** (hours gained + progress)
-- The **daily 8h limit** is reached
-- A **lesson error** occurs (bot keeps retrying)
+The bot sends **one message per lesson** and **edits it in place** as work progresses:
+
+| Step | Message update |
+| :--- | :--- |
+| Lesson starts | New "Current Lesson" card |
+| Reading | Phase 📖 Reading + today's bar (`6.1 / 8 h · 1.9 h left`) |
+| Reflection drafted | Appends the AI reflection text |
+| Reflect phase | Phase ✍️ Reflection + timer |
+| Submitted | "Reflection submitted to site ✓" |
+| Lesson complete | Final summary, then clears for next article |
+
+### Standalone alerts
+
+- Bot **started** or **stopped**
+- **Daily limit reached** (8.0 / 8 h — only when actually waiting for midnight)
+- **Lesson errors** (bot keeps retrying)
 
 Toggle push without removing credentials:
 
 **Menubar → Settings → Telegram Notifications: ON/OFF**
+
+The menubar toggle reflects real state (reads `.env` token + linked chat).
 
 ## Commands
 
 | Command | What it does |
 | :--- | :--- |
 | `/start` | Register this chat for notifications |
-| `/status` | Live engine state, article, phase, timer, progress bar |
-| `/stats` | Overall hours, remaining, ETA, today’s session, bot completions |
+| `/status` | Live phase (Reading / Reflection / Limit wait), today's hours, timer, draft |
+| `/stats` | Overall hours, remaining, ETA, today's session, bot completions |
 | `/help` | Full command reference |
 
-`/status` and `/stats` re-read `events.jsonl` on every request — always live.
+`/status` and `/stats` re-read `events.jsonl` on every request. Phase and daily hours always come from the **same newest event** — you will never see "6.1 h" and "limit reached" at the same time.
 
 ## Example messages
 
-**Lesson complete**
+**Live lesson** (edits in place)
 
 ```
-✅ Lesson Complete
+📚 Current Lesson
 
-Article   Harm Reduction Strategies
-This lesson   +1.20 h
-Today   3.0 h
-Overall   35.8 / 75 h (48%)
+Phase   ✍️ Reflection
+Lesson   Cognitive Restructuring Techniques
+Today   6.1 / 8 h  ██████░░  76%  (1.9 h left)
+Timer   45:12
+Overall   40.9 / 75 h (55%)
 
-Commands: /status · /stats · /help
+Reflection draft (agy)
+I learned that avoiding triggers makes cravings worse...
 ```
 
-**Live status** (`/status`)
+**Daily limit** (`/status` while waiting)
 
 ```
 📍 Live Status
 
 Engine   🟢 Running
-Phase   Reading
-Article   Introduction to CBT
-Timer   29:45
-Progress   35.8 / 75 h
-█████░░░░░  48%
-
-Commands: /status · /stats · /help
+Phase   🌙 Daily limit wait
+Today   8.0 / 8 h  ████████  100%  — limit reached
+Reset in   12h 14m
+Overall   43.9 / 75 h
 ```
 
 ## Architecture
 
 - Notifications use a **background queue** — never blocks Playwright.
+- Lesson updates use `editMessageText` when possible (falls back to new message).
 - API errors are **rate-limited** to `automation.log`; the bot never stops.
 - Only the chat ID saved via `/start` can run commands.
 - Stdlib only (`urllib`) — no extra dependencies.
@@ -83,9 +96,10 @@ Commands: /status · /stats · /help
 
 | File | Purpose |
 | :--- | :--- |
-| `telegram_notify.py` | Module (queue, API, commands) |
+| `telegram_notify.py` | Module (queue, API, commands, live lesson edits) |
 | `telegram_config.json` | Your linked chat ID (gitignored) |
-| `telegram_settings.json` | Runtime ON/OFF from menubar |
+| `telegram_settings.json` | Runtime ON/OFF from menubar (gitignored) |
+| `telegram_lesson_msg.json` | Active lesson message ID for edits (gitignored) |
 | `.env` | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ENABLED` |
 
 ## Troubleshooting
@@ -93,6 +107,7 @@ Commands: /status · /stats · /help
 | Issue | Fix |
 | :--- | :--- |
 | No push after setup | Send `/start` to link chat ID |
+| Menubar shows Telegram OFF but bot works | Restart menubar (loads `.env` on launch) |
+| `/status` wrong phase or hours | Restart bot; status uses newest event anchor |
 | Commands work, no push | Check menubar Telegram toggle is ON |
 | `Telegram API failed` in log | Verify token; regenerate in BotFather if exposed |
-| Bot runs, Telegram silent | `TELEGRAM_ENABLED=1` in `.env` and restart bot |

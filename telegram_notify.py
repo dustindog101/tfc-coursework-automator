@@ -16,11 +16,12 @@ import urllib.error
 import urllib.request
 from collections import deque
 from datetime import date, datetime
-from typing import Optional
+from typing import Any, Optional
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(ROOT_DIR, "telegram_settings.json")
 CONFIG_FILE = os.path.join(ROOT_DIR, "telegram_config.json")
+LESSON_MSG_FILE = os.path.join(ROOT_DIR, "telegram_lesson_msg.json")
 EVENTS_FILE = os.getenv("TFC_EVENTS_FILE", os.path.join(ROOT_DIR, "events.jsonl"))
 BOT_PID_FILE = os.path.join(ROOT_DIR, "bot.pid")
 BOT_COMPLETED_FILE = os.path.join(ROOT_DIR, "bot_completed_courses.json")
@@ -29,15 +30,37 @@ DAILY_HOUR_LIMIT = float(os.getenv("TFC_DAILY_HOUR_LIMIT", "8.0"))
 _log = logging.getLogger("tfc.telegram")
 _started = False
 _start_lock = threading.Lock()
-_msg_queue: queue.Queue[Optional[tuple[int, str]]] = queue.Queue()
+_msg_queue: queue.Queue = queue.Queue()
 _last_error_log = 0.0
 _ERROR_LOG_INTERVAL_S = 300.0
 
-_SKIP_EVENTS = frozenset({
-    "timer_sync", "timer_tick", "scroll_keepalive", "reflection_generated",
+_SKIP_PUSH_EVENTS = frozenset({
+    "timer_sync", "timer_tick", "scroll_keepalive",
 })
 
 _CMD_FOOTER = "<i>Commands: /status · /stats · /help</i>"
+_REFLECTION_PREVIEW_MAX = 600
+
+# Queue ops: ("send", chat_id, text) | ("edit", chat_id, message_id, text)
+
+
+def _load_dotenv() -> None:
+    env_path = os.path.join(ROOT_DIR, ".env")
+    if not os.path.exists(env_path):
+        return
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+    except Exception:
+        pass
+
+
+_load_dotenv()
 
 
 def _esc(text: object) -> str:
@@ -81,14 +104,47 @@ def _log_throttled(msg: str) -> None:
         _log.warning(msg)
 
 
+def is_configured() -> bool:
+    _load_dotenv()
+    return bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip())
+
+
 def is_enabled() -> bool:
-    """True when env + runtime settings allow Telegram."""
-    if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
+    if not is_configured():
         return False
     settings = _load_json(SETTINGS_FILE)
     if "enabled" in settings:
         return bool(settings["enabled"])
     return _env_enabled()
+
+
+def is_linked() -> bool:
+    return get_chat_id() is not None
+
+
+def get_integration_status() -> dict:
+    _load_dotenv()
+    configured = is_configured()
+    linked = is_linked()
+    push_enabled = is_enabled() if configured else False
+    return {
+        "configured": configured,
+        "linked": linked,
+        "push_enabled": push_enabled,
+        "commands_available": configured,
+        "fully_active": configured and push_enabled and linked,
+    }
+
+
+def menubar_label() -> str:
+    s = get_integration_status()
+    if not s["configured"]:
+        return "📱 Telegram: Not configured (.env)"
+    if s["push_enabled"] and s["linked"]:
+        return "📱 Telegram Notifications: ON"
+    if s["push_enabled"] and not s["linked"]:
+        return "📱 Telegram: ON — send /start to link"
+    return "📱 Telegram Notifications: OFF"
 
 
 def get_chat_id() -> Optional[int]:
@@ -116,6 +172,26 @@ def set_enabled(enabled: bool) -> None:
     _save_json(SETTINGS_FILE, {"enabled": enabled})
 
 
+def _load_lesson_msg() -> dict:
+    return _load_json(LESSON_MSG_FILE)
+
+
+def _save_lesson_msg(message_id: int, lesson_title: str, lesson_url: str = "") -> None:
+    _save_json(LESSON_MSG_FILE, {
+        "message_id": message_id,
+        "lesson_title": lesson_title,
+        "lesson_url": lesson_url,
+    })
+
+
+def _clear_lesson_msg() -> None:
+    try:
+        if os.path.exists(LESSON_MSG_FILE):
+            os.remove(LESSON_MSG_FILE)
+    except Exception:
+        pass
+
+
 def _api_request(method: str, payload: dict) -> Optional[dict]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -139,7 +215,7 @@ def _api_request(method: str, payload: dict) -> Optional[dict]:
     return None
 
 
-def send_message(chat_id: int, text: str, *, parse_mode: str = "HTML") -> bool:
+def send_message(chat_id: int, text: str, *, parse_mode: str = "HTML") -> Optional[int]:
     payload: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -148,17 +224,48 @@ def send_message(chat_id: int, text: str, *, parse_mode: str = "HTML") -> bool:
     if parse_mode:
         payload["parse_mode"] = parse_mode
     result = _api_request("sendMessage", payload)
+    if result and result.get("ok"):
+        try:
+            return int(result["result"]["message_id"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None
+
+
+def edit_message(chat_id: int, message_id: int, text: str, *, parse_mode: str = "HTML") -> bool:
+    payload: dict = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    result = _api_request("editMessageText", payload)
     return bool(result and result.get("ok"))
 
 
 def notify(text: str) -> None:
-    """Enqueue a push notification; no-op if disabled or chat not registered."""
     if not is_enabled():
         return
     chat_id = get_chat_id()
     if chat_id is None:
         return
-    _msg_queue.put((chat_id, text))
+    _msg_queue.put(("send", chat_id, text))
+
+
+def _enqueue_lesson_update(text: str, *, new_lesson: bool = False) -> None:
+    if not is_enabled():
+        return
+    chat_id = get_chat_id()
+    if chat_id is None:
+        return
+    stored = _load_lesson_msg()
+    msg_id = stored.get("message_id")
+    if msg_id and not new_lesson:
+        _msg_queue.put(("edit", chat_id, int(msg_id), text))
+    else:
+        _msg_queue.put(("send_lesson", chat_id, text))
 
 
 def _worker() -> None:
@@ -166,10 +273,35 @@ def _worker() -> None:
         item = _msg_queue.get()
         if item is None:
             break
-        chat_id, text = item
         if not is_enabled():
             continue
-        send_message(chat_id, text)
+        try:
+            op = item[0]
+            if op == "send":
+                _, chat_id, text = item
+                send_message(int(chat_id), text)
+            elif op == "send_lesson":
+                _, chat_id, text = item
+                mid = send_message(int(chat_id), text)
+                if mid:
+                    title = _extract_title_from_card(text)
+                    _save_lesson_msg(mid, title)
+            elif op == "edit":
+                _, chat_id, message_id, text = item
+                if not edit_message(int(chat_id), int(message_id), text):
+                    mid = send_message(int(chat_id), text)
+                    if mid:
+                        title = _extract_title_from_card(text)
+                        _save_lesson_msg(mid, title)
+        except Exception as exc:
+            _log_throttled(f"Telegram worker error: {exc}")
+
+
+def _extract_title_from_card(text: str) -> str:
+    for line in text.splitlines():
+        if "<b>Article</b>" in line or "<b>Lesson</b>" in line:
+            return line.split("  ", 1)[-1].strip()
+    return ""
 
 
 def _fmt_ts(ts: str) -> str:
@@ -181,9 +313,220 @@ def _fmt_ts(ts: str) -> str:
         return ts[:16]
 
 
+def _format_timer_secs(secs: Optional[int]) -> str:
+    if secs is None or secs <= 0:
+        return "—"
+    if secs >= 3600:
+        return f"{secs // 3600}h {(secs % 3600) // 60:02d}m"
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+def _daily_line(hours_today: float, *, at_limit: bool = False) -> str:
+    hours_today = max(0.0, float(hours_today))
+    pct = min(100, int((hours_today / DAILY_HOUR_LIMIT) * 100)) if DAILY_HOUR_LIMIT > 0 else 0
+    bar_w = 8
+    filled = int((hours_today / DAILY_HOUR_LIMIT) * bar_w) if DAILY_HOUR_LIMIT > 0 else 0
+    filled = min(bar_w, max(0, filled))
+    bar = "█" * filled + "░" * (bar_w - filled)
+    if at_limit or hours_today >= DAILY_HOUR_LIMIT - 0.05:
+        return (
+            f"<b>Today</b>  {hours_today:.1f} / {DAILY_HOUR_LIMIT:.0f} h  "
+            f"<code>{bar}</code> {pct}%  — <b>limit reached</b>"
+        )
+    remaining = max(0.0, DAILY_HOUR_LIMIT - hours_today)
+    return (
+        f"<b>Today</b>  {hours_today:.1f} / {DAILY_HOUR_LIMIT:.0f} h  "
+        f"<code>{bar}</code> {pct}%  ({remaining:.1f} h left)"
+    )
+
+
+def _phase_label(phase: str) -> str:
+    return {
+        "starting": "🚀 Starting",
+        "reading": "📖 Reading",
+        "reflect": "✍️ Reflection",
+        "submitted": "✅ Submitted",
+        "limit_wait": "🌙 Daily limit wait",
+        "idle": "💤 Idle",
+    }.get(phase, phase)
+
+
+def _truncate_reflection(text: str, max_len: int = _REFLECTION_PREVIEW_MAX) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _parse_live_state(events: list[dict]) -> dict[str, Any]:
+    """Phase + hours from the same newest anchor — never mix stale timer_sync with limit wait."""
+    state: dict[str, Any] = {
+        "phase": "idle",
+        "lesson_title": None,
+        "article_title": None,
+        "timer_secs": None,
+        "hours_today": 0.0,
+        "hours_remaining_today": DAILY_HOUR_LIMIT,
+        "hours_done": 0.0,
+        "hours_total": 75.0,
+        "reflection": None,
+        "reflection_source": None,
+        "limit_reset_secs": None,
+        "at_daily_limit": False,
+    }
+
+    anchor: Optional[dict] = None
+
+    for ev in reversed(events):
+        e = ev.get("event")
+        if e == "reflect_submitted":
+            state["phase"] = "submitted"
+            state["lesson_title"] = ev.get("lesson_title")
+            state["article_title"] = ev.get("article_title")
+            anchor = ev
+            break
+        if e == "reflect_start":
+            state["phase"] = "reflect"
+            state["lesson_title"] = ev.get("lesson_title")
+            state["article_title"] = ev.get("article_title")
+            anchor = ev
+            break
+        if e == "reading_start":
+            state["phase"] = "reading"
+            state["lesson_title"] = ev.get("lesson_title")
+            anchor = ev
+            break
+        if e == "lesson_start":
+            state["phase"] = "starting"
+            state["lesson_title"] = ev.get("lesson_title")
+            anchor = ev
+            break
+        if e == "daily_limit_wait_complete":
+            state["phase"] = "idle"
+            anchor = ev
+            break
+        if e in ("daily_limit_wait_start", "daily_limit_hit"):
+            state["phase"] = "limit_wait"
+            state["at_daily_limit"] = True
+            anchor = ev
+            if e == "daily_limit_wait_start":
+                state["limit_reset_secs"] = ev.get("seconds_until_midnight")
+            break
+
+    for ev in reversed(events):
+        if ev.get("event") == "progress_snapshot":
+            state["hours_done"] = float(ev.get("done", state["hours_done"]))
+            state["hours_total"] = float(ev.get("total", 75))
+            break
+
+    for ev in reversed(events):
+        if ev.get("event") == "reflection_generated":
+            state["reflection"] = ev.get("reflection")
+            state["reflection_source"] = ev.get("source")
+            state["article_title"] = ev.get("article_title") or state["article_title"]
+            if not state["lesson_title"]:
+                state["lesson_title"] = ev.get("lesson_title")
+            break
+
+    phase = state["phase"]
+
+    if phase == "limit_wait" and anchor:
+        state["hours_today"] = float(
+            anchor.get("hours_today", DAILY_HOUR_LIMIT)
+        )
+        state["hours_remaining_today"] = float(
+            anchor.get("hours_remaining", 0.0)
+        )
+        state["timer_secs"] = state.get("limit_reset_secs")
+    elif phase in ("reading", "reflect", "starting", "submitted"):
+        for ev in reversed(events):
+            if ev.get("event") != "timer_sync":
+                continue
+            state["timer_secs"] = ev.get("timer_secs")
+            if ev.get("hours_today") is not None:
+                state["hours_today"] = float(ev["hours_today"])
+            if ev.get("hours_done") is not None:
+                state["hours_done"] = float(ev["hours_done"])
+            if ev.get("lesson_title"):
+                state["lesson_title"] = ev["lesson_title"]
+            break
+        if anchor:
+            if anchor.get("hours_today") is not None and state["hours_today"] <= 0:
+                state["hours_today"] = float(anchor["hours_today"])
+            if anchor.get("hours_done") is not None and state["hours_done"] <= 0:
+                state["hours_done"] = float(anchor["hours_done"])
+        state["hours_remaining_today"] = max(0.0, DAILY_HOUR_LIMIT - state["hours_today"])
+        state["at_daily_limit"] = state["hours_today"] >= DAILY_HOUR_LIMIT - 0.05
+    elif anchor and anchor.get("hours_today") is not None:
+        state["hours_today"] = float(anchor["hours_today"])
+        state["hours_remaining_today"] = max(0.0, DAILY_HOUR_LIMIT - state["hours_today"])
+
+    return state
+
+
+def _build_lesson_card(
+    *,
+    lesson_title: str,
+    phase: str,
+    article_title: str = "",
+    hours_today: float = 0.0,
+    hours_done: float = 0.0,
+    hours_total: float = 75.0,
+    timer_secs: Optional[int] = None,
+    reflection: Optional[str] = None,
+    reflection_source: Optional[str] = None,
+    submitted: bool = False,
+) -> str:
+    title = "✅ Lesson Submitted" if submitted or phase == "submitted" else "📚 Current Lesson"
+    lines = [
+        f"<b>Phase</b>  {_phase_label('submitted' if submitted else phase)}",
+        f"<b>Lesson</b>  {_esc(lesson_title or '—')}",
+    ]
+    if article_title and article_title != lesson_title:
+        lines.append(f"<b>Article</b>  {_esc(article_title)}")
+    if phase in ("reading", "reflect", "starting", "submitted") and hours_today is not None:
+        at_limit = hours_today >= DAILY_HOUR_LIMIT - 0.05
+        lines.append(_daily_line(hours_today, at_limit=at_limit))
+    if timer_secs and phase in ("reading", "reflect"):
+        lines.append(f"<b>Timer</b>  {_esc(_format_timer_secs(timer_secs))}")
+    if hours_done and hours_total:
+        pct = int((hours_done / hours_total) * 100) if hours_total > 0 else 0
+        lines.append(f"<b>Overall</b>  {hours_done:.1f} / {hours_total:.0f} h ({pct}%)")
+    if reflection:
+        preview = _truncate_reflection(reflection)
+        src = f" ({reflection_source})" if reflection_source else ""
+        lines.append("")
+        lines.append(f"<b>Reflection draft</b>{_esc(src)}")
+        lines.append(f"<i>{_esc(preview)}</i>")
+    if submitted or phase == "submitted":
+        lines.append("")
+        lines.append("<b>Status</b>  Reflection submitted to site ✓")
+    return _card(title, lines)
+
+
+def _build_lesson_card_from_record(record: dict, phase: Optional[str] = None) -> str:
+    events = _tail_events()
+    live = _parse_live_state(events)
+    p = phase or live["phase"]
+    reflection = record.get("reflection") or live.get("reflection")
+    return _build_lesson_card(
+        lesson_title=record.get("lesson_title") or live.get("lesson_title") or "—",
+        phase=p,
+        article_title=record.get("article_title") or live.get("article_title") or "",
+        hours_today=float(record.get("hours_today", live.get("hours_today", 0))),
+        hours_done=float(record.get("hours_done", live.get("hours_done", 0))),
+        hours_total=float(live.get("hours_total", 75)),
+        timer_secs=live.get("timer_secs"),
+        reflection=reflection,
+        reflection_source=record.get("source") or live.get("reflection_source"),
+        submitted=(p == "submitted"),
+    )
+
+
 def event_to_message(record: dict) -> Optional[str]:
+    """Standalone push messages (not the live lesson thread)."""
     event = record.get("event", "")
-    if event in _SKIP_EVENTS:
+    if event in _SKIP_PUSH_EVENTS:
         return None
 
     if event == "bot_start":
@@ -193,33 +536,6 @@ def event_to_message(record: dict) -> Optional[str]:
             [
                 f"<b>Time</b>  {_esc(when)}" if when else "<b>Status</b>  Engine online",
                 "<b>Mode</b>  Automated coursework",
-            ],
-        )
-
-    if event == "lesson_start":
-        title = record.get("lesson_title") or "Unknown lesson"
-        return _card(
-            "📖 New Article",
-            [
-                f"<b>Title</b>  {_esc(title)}",
-                "<b>Phase</b>  Starting lesson",
-            ],
-        )
-
-    if event == "lesson_complete":
-        title = record.get("lesson_title") or "Unknown lesson"
-        gained = float(record.get("hours_gained", 0.0))
-        today = float(record.get("hours_today", 0.0))
-        done = float(record.get("hours_done", 0.0))
-        total = float(record.get("hours_total", 75.0) or 75.0)
-        pct = int((done / total) * 100) if total > 0 else 0
-        return _card(
-            "✅ Lesson Complete",
-            [
-                f"<b>Article</b>  {_esc(title)}",
-                f"<b>This lesson</b>  +{gained:.2f} h",
-                f"<b>Today</b>  {today:.1f} h",
-                f"<b>Overall</b>  {done:.1f} / {total:.0f} h ({pct}%)",
             ],
         )
 
@@ -240,7 +556,7 @@ def event_to_message(record: dict) -> Optional[str]:
         return _card(
             "🌙 Daily Limit Reached",
             [
-                f"<b>Logged today</b>  {hours:.1f} h / {DAILY_HOUR_LIMIT:.0f} h",
+                _daily_line(hours, at_limit=True),
                 "<b>Next</b>  Waiting for midnight reset",
                 "<b>Bot</b>  Still running — will resume automatically",
             ],
@@ -258,6 +574,61 @@ def event_to_message(record: dict) -> Optional[str]:
 
 
 def on_event(record: dict) -> None:
+    if not is_enabled() or get_chat_id() is None:
+        return
+
+    event = record.get("event", "")
+
+    if event == "lesson_start":
+        _clear_lesson_msg()
+        _enqueue_lesson_update(
+            _build_lesson_card_from_record(record, phase="starting"),
+            new_lesson=True,
+        )
+        return
+
+    if event == "reading_start":
+        _enqueue_lesson_update(_build_lesson_card_from_record(record, phase="reading"))
+        return
+
+    if event == "reflection_generated":
+        _enqueue_lesson_update(_build_lesson_card_from_record(record, phase="reading"))
+        return
+
+    if event == "reflect_start":
+        _enqueue_lesson_update(_build_lesson_card_from_record(record, phase="reflect"))
+        return
+
+    if event == "reflect_submitted":
+        card = _build_lesson_card_from_record(record, phase="submitted")
+        _enqueue_lesson_update(card)
+        return
+
+    if event == "lesson_complete":
+        title = record.get("lesson_title") or "Unknown lesson"
+        gained = float(record.get("hours_gained", 0.0))
+        today = float(record.get("hours_today", 0.0))
+        done = float(record.get("hours_done", 0.0))
+        total = float(record.get("hours_total", 75.0) or 75.0)
+        pct = int((done / total) * 100) if total > 0 else 0
+        complete_card = _card(
+            "✅ Lesson Complete",
+            [
+                f"<b>Article</b>  {_esc(title)}",
+                f"<b>This lesson</b>  +{gained:.2f} h",
+                _daily_line(today),
+                f"<b>Overall</b>  {done:.1f} / {total:.0f} h ({pct}%)",
+            ],
+        )
+        stored = _load_lesson_msg()
+        chat_id = get_chat_id()
+        if stored.get("message_id") and chat_id:
+            _msg_queue.put(("edit", chat_id, int(stored["message_id"]), complete_card))
+        else:
+            notify(complete_card)
+        _clear_lesson_msg()
+        return
+
     msg = event_to_message(record)
     if msg:
         notify(msg)
@@ -317,81 +688,45 @@ def _progress_bar(done: float, total: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def _format_timer_secs(secs: int) -> str:
-    if secs >= 3600:
-        return f"{secs // 3600}h {(secs % 3600) // 60:02d}m"
-    return f"{secs // 60}:{secs % 60:02d}"
-
-
 def build_status_text() -> str:
     events = _tail_events()
+    live = _parse_live_state(events)
     running = is_bot_running()
 
-    progress: dict = {}
-    lesson_title = None
-    phase = None
-    timer_end_at = None
-    limit_wait = False
-    session_done = 0
+    lines = [f"<b>Engine</b>  {'🟢 Running' if running else '🔴 Stopped'}"]
 
-    for ev in reversed(events):
-        if not progress and ev.get("event") == "progress_snapshot":
-            progress = ev
-        ev_name = ev.get("event", "")
-        if ev_name in ("daily_limit_hit", "daily_limit_wait_start"):
-            limit_wait = True
-        if ev_name == "lesson_start" and lesson_title is None:
-            lesson_title = ev.get("lesson_title")
-        if ev_name == "reading_start":
-            phase = "Reading"
-            if not lesson_title:
-                lesson_title = ev.get("lesson_title")
-        if ev_name == "reflect_start":
-            phase = "Reflection"
-            if not lesson_title:
-                lesson_title = ev.get("lesson_title")
-        if ev_name == "timer_sync" and timer_end_at is None:
-            timer_end_at = ev.get("timer_end_at")
+    phase = live["phase"]
+    lines.append(f"<b>Phase</b>  {_phase_label(phase)}")
 
-    today = date.today().isoformat()
-    for ev in events:
-        if ev.get("event") == "lesson_complete" and ev.get("date") == today:
-            session_done += 1
+    if live.get("lesson_title") and phase != "limit_wait":
+        lines.append(f"<b>Lesson</b>  {_esc(live['lesson_title'])}")
+    if live.get("article_title") and live["article_title"] != live.get("lesson_title"):
+        lines.append(f"<b>Article</b>  {_esc(live['article_title'])}")
 
-    lines = [
-        f"<b>Engine</b>  {'🟢 Running' if running else '🔴 Stopped'}",
-    ]
+    hours_today = float(live.get("hours_today", 0))
 
-    if limit_wait:
-        lines.append("<b>Phase</b>  🌙 Daily limit wait")
-    elif phase:
-        lines.append(f"<b>Phase</b>  {_esc(phase)}")
-    elif lesson_title:
-        lines.append("<b>Phase</b>  Lesson")
-    else:
-        lines.append("<b>Phase</b>  Idle")
+    if phase == "limit_wait":
+        lines.append(_daily_line(hours_today or DAILY_HOUR_LIMIT, at_limit=True))
+        reset = live.get("limit_reset_secs") or live.get("timer_secs")
+        if reset:
+            lines.append(f"<b>Reset in</b>  {_esc(_format_timer_secs(int(reset)))}")
+    elif phase in ("reading", "reflect", "starting", "submitted"):
+        lines.append(_daily_line(hours_today, at_limit=live.get("at_daily_limit", False)))
 
-    if lesson_title:
-        lines.append(f"<b>Article</b>  {_esc(lesson_title)}")
+    if live.get("timer_secs") and phase in ("reading", "reflect"):
+        lines.append(f"<b>Timer</b>  {_esc(_format_timer_secs(live['timer_secs']))}")
 
-    if timer_end_at:
-        try:
-            end = datetime.fromisoformat(timer_end_at)
-            secs = max(0, int(end.timestamp() - time.time()))
-            lines.append(f"<b>Timer</b>  {_esc(_format_timer_secs(secs))}")
-        except Exception:
-            pass
-
-    if progress:
-        done = float(progress.get("done", progress.get("hours_done", 0)))
-        total = float(progress.get("total", 75))
+    done = float(live.get("hours_done", 0))
+    total = float(live.get("hours_total", 75))
+    if done or total:
         pct = int((done / total) * 100) if total > 0 else 0
         bar = _progress_bar(done, total)
-        lines.append(f"<b>Progress</b>  {done:.1f} / {total:.0f} h")
+        lines.append(f"<b>Overall</b>  {done:.1f} / {total:.0f} h")
         lines.append(f"<code>{bar}</code>  {pct}%")
 
-    if session_done:
-        lines.append(f"<b>Today</b>  {session_done} lesson{'s' if session_done != 1 else ''} this session")
+    if live.get("reflection") and phase in ("reading", "reflect", "submitted"):
+        preview = _truncate_reflection(str(live["reflection"]), 200)
+        lines.append(f"<b>Draft</b>  <i>{_esc(preview)}</i>")
 
     if not events:
         lines.append("<i>No events logged yet — start the bot first.</i>")
@@ -414,7 +749,13 @@ def build_stats_text() -> str:
             hours_today += float(ev.get("hours_gained", 0.0))
             session_done += 1
 
-    done = float(progress.get("done", progress.get("hours_done", 0)))
+    live = _parse_live_state(events)
+    if live["phase"] == "limit_wait":
+        hours_today = float(live["hours_today"])
+    elif live.get("hours_today"):
+        hours_today = max(hours_today, float(live["hours_today"]))
+
+    done = float(progress.get("done", progress.get("hours_done", live.get("hours_done", 0))))
     total = float(progress.get("total", 75))
     remaining = float(progress.get("remaining", max(0.0, total - done)))
     pct = int((done / total) * 100) if total > 0 else 0
@@ -444,10 +785,11 @@ def build_stats_text() -> str:
         f"<b>Overall</b>  {done:.1f} / {total:.0f} h",
         f"<code>{bar}</code>  {pct}%",
         f"<b>Remaining</b>  {remaining:.1f} h · {eta}",
-        f"<b>Today</b>  {hours_today:.1f} h · {session_done} lesson{'s' if session_done != 1 else ''}",
+        _daily_line(hours_today, at_limit=live.get("at_daily_limit", False)),
+        f"<b>Session</b>  {session_done} lesson{'s' if session_done != 1 else ''} today",
         f"<b>Lessons completed</b>  {bot_count} (bot-tracked)",
         f"<b>Engine</b>  {'🟢 Running' if is_bot_running() else '🔴 Stopped'}",
-        f"<b>Daily cap</b>  {DAILY_HOUR_LIMIT:.0f} h / day",
+        f"<b>Now</b>  {_phase_label(live['phase'])}",
     ]
 
     return _card("📊 Coursework Stats", lines)
@@ -458,11 +800,11 @@ def build_help_text() -> str:
         "🤖 TFC Bot — Commands",
         [
             "<b>/start</b>  Link this chat for push notifications",
-            "<b>/status</b>  Live article, phase, timer, and progress",
-            "<b>/stats</b>  Total hours, today's work, completions, ETA",
+            "<b>/status</b>  Live phase (reading/reflect), daily limit, timer, draft",
+            "<b>/stats</b>  Total hours, today's bar, completions, ETA",
             "<b>/help</b>  Show this message",
             "",
-            "<b>Push alerts</b>  Bot start/stop, new article, lesson done, daily limit, errors",
+            "<b>Live lesson message</b>  One message per article — updates as the bot reads, drafts reflection, and submits",
             "<b>Toggle</b>  Menubar → Settings → Telegram Notifications",
         ],
         footer=False,
@@ -473,14 +815,10 @@ def build_welcome_text() -> str:
     return _card(
         "✅ Chat Linked",
         [
-            "You will receive notifications when the bot:",
-            "  • Starts or stops",
-            "  • Begins a new article",
-            "  • Completes a lesson",
-            "  • Hits the daily hour limit",
-            "  • Encounters an error",
+            "One live message per lesson — it updates through:",
+            "  📖 Reading → draft reflection → ✍️ Reflect → ✅ Submitted",
             "",
-            "Use the commands below anytime for a live check-in.",
+            "Also get alerts for daily limit, errors, and bot start/stop.",
         ],
         footer=False,
     ) + "\n\n" + build_help_text()
@@ -552,7 +890,6 @@ def _command_listener() -> None:
 
 
 def start() -> None:
-    """Start worker + command listener threads (idempotent)."""
     global _started
     with _start_lock:
         if _started:

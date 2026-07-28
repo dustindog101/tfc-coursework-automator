@@ -146,7 +146,7 @@ TELEGRAM_ENABLED=1
 ```
 
 1. Start bot → message `/start` to link chat
-2. `/status` — live article & phase | `/stats` — hours & ETA
+2. `/status` — live phase + daily bar (`X / 8 h`, hours left or limit reached) | `/stats` — hours & ETA
 3. Toggle push: menubar → Settings → Telegram Notifications
 
 Full guide: [docs/TELEGRAM.md](../../docs/TELEGRAM.md). Failures never stop the bot.
