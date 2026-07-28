@@ -21,6 +21,7 @@ Check logs:
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -54,6 +55,24 @@ def _load_dotenv():
 
 _load_dotenv()
 
+# macOS: avoid harmless "MallocStackLogging: can't turn off..." spam from child processes
+_MALLOC_ENV_KEYS = (
+    "MallocStackLogging", "MallocStackLoggingNoCompact", "MallocScribble",
+    "MallocGuardEdges", "MALLOC_STACK_LOGGING",
+)
+for _mk in _MALLOC_ENV_KEYS:
+    os.environ.pop(_mk, None)
+
+
+def subprocess_env(extra: Optional[dict] = None) -> dict:
+    """Clean env for child processes (Playwright/agy/caffeinate on macOS)."""
+    env = os.environ.copy()
+    for key in _MALLOC_ENV_KEYS:
+        env.pop(key, None)
+    if extra:
+        env.update(extra)
+    return env
+
 EMAIL = os.getenv("TFC_EMAIL", "")
 PASSWORD = os.getenv("TFC_PASSWORD", "")
 BASE_URL = os.getenv("TFC_BASE_URL", "https://www.thefoundationofchange.org")
@@ -61,33 +80,84 @@ LOG_FILE = os.getenv("TFC_LOG_FILE", os.path.join(ROOT_DIR, "automation.log"))
 EVENTS_FILE = os.getenv("TFC_EVENTS_FILE", os.path.join(ROOT_DIR, "events.jsonl"))
 COMPLETED_COURSES_FILE = os.getenv("TFC_COMPLETED_COURSES_FILE", os.path.join(ROOT_DIR, "completed_courses.json"))
 
-SCROLL_INTERVAL_S = 165   # ~2.75 min
-POLL_INTERVAL_S   = 25    # timer poll frequency
+SCROLL_INTERVAL_S = 165   # ~2.75 min (bundled with timer resync)
+TIMER_RESYNC_S    = 165   # DOM timer read + scroll keepalive interval
+LOCAL_TICK_S      = 60    # local sleep between UI updates (no DOM)
+STATUS_UPDATE_S   = 60    # refresh terminal status line at most this often
+TIMER_DRIFT_TOLERANCE_S = 15
 REFLECTION_MIN    = 80
 REFLECTION_MAX    = 295
 DAILY_HOUR_LIMIT  = float(os.getenv("TFC_DAILY_HOUR_LIMIT", "8.0"))
 MIN_HOURS_LEFT    = float(os.getenv("TFC_MIN_HOURS_LEFT", "0.35"))  # don't start if less left today
 
 # ── Logging (text) ────────────────────────────────────────────────────────────
+_status_line_active = False
+
+
 class TerminalLogHandler(logging.Handler):
+    """Terminal: important logs only; always newline before log if status line is active."""
     def emit(self, record):
+        global _status_line_active
         try:
             msg = self.format(record)
-            sys.stderr.write("\033[2K\r")
+            if _status_line_active:
+                sys.stderr.write("\n")
+                _status_line_active = False
             sys.stderr.write(msg + "\n")
             sys.stderr.flush()
         except Exception:
             self.handleError(record)
 
+
+class _StatusOnlyFilter(logging.Filter):
+    """Drop noisy INFO during normal operation from the terminal handler."""
+    _NOISY_PREFIXES = (
+        "agy reflection", "opencode reflection", "↕ scroll", "⏱ ",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno > logging.INFO:
+            return True
+        msg = record.getMessage()
+        if any(msg.startswith(p) or f" {p}" in msg for p in self._NOISY_PREFIXES):
+            return False
+        if "[READ] ↕" in msg or "[REFLECT] ↕" in msg:
+            return False
+        if "min remaining" in msg and record.levelno == logging.INFO:
+            return False
+        return True
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        TerminalLogHandler(),
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("tfc")
+if sys.stderr.isatty():
+    _term_handler = TerminalLogHandler()
+    _term_handler.setLevel(logging.INFO)
+    _term_handler.addFilter(_StatusOnlyFilter())
+    log.addHandler(_term_handler)
+
+BOT_PID_FILE = os.path.join(ROOT_DIR, "bot.pid")
+
+
+def write_bot_pid() -> None:
+    try:
+        with open(BOT_PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def remove_bot_pid() -> None:
+    try:
+        if os.path.exists(BOT_PID_FILE):
+            os.remove(BOT_PID_FILE)
+    except Exception:
+        pass
 
 
 # ── Structured event log (JSONL) ──────────────────────────────────────────────
@@ -105,6 +175,11 @@ def log_event(event: str, **kwargs):
     }
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
+    try:
+        import telegram_notify
+        telegram_notify.on_event(record)
+    except Exception as e:
+        log.warning("Telegram notify skipped: %s", e)
     return record
 
 
@@ -191,7 +266,7 @@ class CaffeinateManager:
 
     def start(self):
         if self.enabled and (self.proc is None or self.proc.poll() is not None):
-            self.proc = subprocess.Popen(["caffeinate", "-i", "-s"])
+            self.proc = subprocess.Popen(["caffeinate", "-i", "-s"], env=subprocess_env())
             log.info("☕ Smart Caffeinate Active (Keeping Mac awake during active coursework)")
 
     def stop(self):
@@ -217,9 +292,44 @@ class RunState:
     hours_done: float = 0.0
     hours_today: float = 0.0
     hours_total: float = 75.0
+    hours_remaining: float = 75.0
+    user_name: str = ""
 
 
 RUN_STATE = RunState()
+
+
+def estimate_days_to_complete(
+    hours_remaining: float, hours_today: float = 0.0,
+    daily_limit: float = DAILY_HOUR_LIMIT,
+) -> int:
+    """Estimate calendar days until all hours are done at daily_limit per day."""
+    if hours_remaining <= 0:
+        return 0
+    avail_today = max(0.0, daily_limit - hours_today)
+    if hours_remaining <= avail_today:
+        return 0
+    after_today = hours_remaining - avail_today
+    return int(math.ceil(after_today / daily_limit))
+
+
+def format_timer_display(secs: int) -> str:
+    """Human timer string; handles long limit-wait countdowns."""
+    if secs <= 0:
+        return "00:00"
+    if secs >= 3600:
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return f"{h}h {m:02d}m"
+    return f"{secs // 60}:{secs % 60:02d}"
+
+
+def format_eta_label(days: int) -> str:
+    if days <= 0:
+        return "finish today"
+    if days == 1:
+        return "~1 day left"
+    return f"~{days} days left"
 
 
 def set_terminal_title(text: str):
@@ -235,57 +345,64 @@ def make_progress_bar(done: float, total: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 def format_status_line(rs: RunState) -> str:
-    remaining_today = max(0, DAILY_HOUR_LIMIT - rs.hours_today)
-    timer_str = f"{rs.timer_secs//60}:{rs.timer_secs%60:02d}" if rs.timer_secs > 0 else "00:00"
-    title = rs.title[:42] if rs.title else "…"
-    pos = f"#{rs.queue_pos}/{rs.queue_total}" if rs.queue_total else "#?"
-    done_str = f"done:{rs.catalog_done}+{rs.session_done}"
-    
-    C_RESET = "\033[0m"
-    C_PHASE = "\033[1;36m" if "WAIT" not in rs.phase else "\033[1;35m"
-    C_TIMER = "\033[1;33m"
-    C_STATS = "\033[1;97m"
-    C_GREEN = "\033[1;32m"
-    
-    phase_icons = {
-        "READ": "📖 READ",
-        "REFLECT": "✍️ REFLECT",
-        "LIMIT_WAIT": "🌙 LIMIT_WAIT",
-        "START": "🚀 START",
-    }
-    phase_str = phase_icons.get(rs.phase, rs.phase)
-
-    prog_pct = int((rs.hours_done / rs.hours_total) * 100) if rs.hours_total > 0 else 0
+    """Single-line live status — no cryptic counters."""
+    timer_str = format_timer_display(rs.timer_secs)
+    title = (rs.title[:28] + "…") if len(rs.title) > 29 else (rs.title or "—")
+    pct = int((rs.hours_done / rs.hours_total) * 100) if rs.hours_total > 0 else 0
     bar = make_progress_bar(rs.hours_done, rs.hours_total)
-    
+    eta = format_eta_label(estimate_days_to_complete(rs.hours_remaining, rs.hours_today))
+
+    if rs.phase == "LIMIT_WAIT":
+        return (
+            f"🌙 Daily limit │ reset in {timer_str} │ "
+            f"{rs.hours_done:.1f}/{rs.hours_total:.0f}h [{bar}] {pct}% │ {eta}"
+        )
+
+    phase = {"READ": "📖 Reading", "REFLECT": "✍️ Reflecting", "START": "🚀 Starting"}.get(
+        rs.phase, rs.phase
+    )
+    lesson_no = f" #{rs.queue_pos}" if rs.queue_pos else ""
     return (
-        f"TFC {done_str:<12} │ {pos:<7} │ "
-        f"{C_PHASE}{phase_str:<15}{C_RESET} │ "
-        f"{C_TIMER}{timer_str:<5}{C_RESET} │ "
-        f"{title:<42} │ "
-        f"{C_STATS}today {rs.hours_today:.1f}/{DAILY_HOUR_LIMIT:.0f}h{C_RESET} │ "
-        f"{C_GREEN}[{bar}] {prog_pct:3}%{C_RESET} "
-        f"({rs.hours_done:.1f}/{rs.hours_total:.0f}h) │ "
-        f"left {remaining_today:.1f}h"
+        f"{phase}{lesson_no} │ {timer_str} │ {title} │ "
+        f"{rs.hours_done:.1f}/{rs.hours_total:.0f}h [{bar}] {pct}% │ "
+        f"today {rs.hours_today:.1f}/{DAILY_HOUR_LIMIT:.0f}h │ {eta}"
     )
 
 
 def live_status(phase: str, timer_secs: int, lesson_title: str,
                 hours_done: float, hours_today: float, hours_total: float,
-                rs: Optional[RunState] = None):
-    """Print live status to stderr and set terminal window title."""
+                rs: Optional[RunState] = None, *, force: bool = False):
+    """Update in-place terminal status line (throttled unless force=True)."""
+    global _status_line_active
     state = rs or RUN_STATE
+    now = time.time()
+    if not force and phase == state.phase and (now - getattr(state, "_last_status_ts", 0)) < STATUS_UPDATE_S:
+        state.timer_secs = timer_secs
+        state.title = lesson_title
+        return
+    state._last_status_ts = now  # type: ignore[attr-defined]
     state.phase = phase
     state.timer_secs = timer_secs
     state.title = lesson_title
     state.hours_done = hours_done
     state.hours_today = hours_today
     state.hours_total = hours_total
+    state.hours_remaining = max(0.0, hours_total - hours_done)
     line = format_status_line(state)
     sys.stderr.write("\033[2K\r" + line)
     sys.stderr.flush()
+    _status_line_active = True
     clean_line = re.sub(r'\033\[[0-9;]*m', '', line)
     set_terminal_title(clean_line)
+
+
+def clear_live_status():
+    """End in-place status line before multi-line log output."""
+    global _status_line_active
+    if _status_line_active:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        _status_line_active = False
 
 
 # ── agy reflection via CLI pipe ───────────────────────────────────────────────
@@ -358,12 +475,12 @@ def _run_llm_prompt(system_prompt: str) -> Optional[tuple[str, str]]:
     try:
         result = subprocess.run(
             ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)"],
-            capture_output=True, text=True, timeout=60, cwd=ROOT_DIR,
+            capture_output=True, text=True, timeout=60, cwd=ROOT_DIR, env=subprocess_env(),
         )
         if result.returncode == 0:
             text = _extract_prose(_clean_llm_text(result.stdout))
             if len(text) >= REFLECTION_MIN:
-                log.info(f"agy reflection ({len(text)} chars): {text!r}")
+                log.debug(f"agy reflection ({len(text)} chars): {text!r}")
                 return text, "agy"
             log.warning(f"agy output too short ({len(text)} chars): {text!r}")
         elif _agy_hit_limit(result):
@@ -382,12 +499,12 @@ def _run_llm_prompt(system_prompt: str) -> Optional[tuple[str, str]]:
     try:
         cmd, tmp_path = _build_opencode_cmd(system_prompt)
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, cwd=ROOT_DIR,
+            cmd, capture_output=True, text=True, timeout=120, cwd=ROOT_DIR, env=subprocess_env(),
         )
         if result.returncode == 0:
             prose = _extract_prose(_clean_llm_text(result.stdout))
             if len(prose) >= REFLECTION_MIN:
-                log.info(f"opencode reflection ({len(prose)} chars): {prose!r}")
+                log.debug(f"opencode reflection ({len(prose)} chars): {prose!r}")
                 return prose, "opencode"
             log.warning(f"opencode output too short ({len(prose)} chars)")
         else:
@@ -437,10 +554,18 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> tuple[s
     return r, "fallback"
 
 
+_last_reflection_logged: tuple[str, str, str] = ("", "", "")
+
+
 def log_reflection_generated(
     lesson_title: str, article_title: str, reflection: str, source: str,
 ) -> None:
     """Write reflection to events.jsonl so menubar can display it immediately."""
+    global _last_reflection_logged
+    key = (article_title, reflection, source)
+    if key == _last_reflection_logged:
+        return
+    _last_reflection_logged = key
     log_event(
         "reflection_generated",
         lesson_title=lesson_title,
@@ -538,29 +663,99 @@ async def scroll_keepalive(page):
             )
             await page.wait_for_timeout(350)
         log.debug("↕ scroll keepalive")
-        log_event("scroll_keepalive")
     except Exception as e:
         log.debug(f"scroll err: {e}")
 
 
+@dataclass
+class LocalTimer:
+    """Wall-clock countdown; resync from page only on schedule."""
+    end_ts: float = 0.0
+
+    def set(self, secs: int) -> None:
+        self.end_ts = time.time() + max(0, secs)
+
+    def remaining(self) -> int:
+        if self.end_ts <= 0:
+            return 0
+        return max(0, int(self.end_ts - time.time()))
+
+    def expired(self) -> bool:
+        return self.remaining() == 0
+
+    def end_at_iso(self) -> str:
+        if self.end_ts <= 0:
+            return ""
+        return datetime.fromtimestamp(self.end_ts).isoformat(timespec="seconds")
+
+    def resync(self, page_secs: int, tolerance: int = TIMER_DRIFT_TOLERANCE_S) -> bool:
+        """Adjust if page timer differs from local estimate beyond tolerance."""
+        if page_secs <= 0:
+            return False
+        drift = abs(page_secs - self.remaining())
+        if drift > tolerance:
+            log.debug(f"Timer drift {drift}s — resyncing local to {page_secs}s")
+            self.set(page_secs)
+            return True
+        return False
+
+
+def log_timer_sync(
+    local: LocalTimer, phase: str, lesson_title: str,
+    hours_done: float, hours_today: float,
+) -> None:
+    rem = local.remaining()
+    log_event(
+        "timer_sync",
+        phase=phase,
+        timer_secs=rem,
+        timer_end_at=local.end_at_iso(),
+        lesson_title=lesson_title,
+        hours_done=hours_done,
+        hours_today=hours_today,
+    )
+
+
 def parse_timer(body: str) -> int:
+    """Return the smallest MM:SS countdown found (active phase timer)."""
+    best = 0
     for m, s in re.findall(r'\b(\d{1,2}):(\d{2})\b', body):
         mins, secs = int(m), int(s)
         if 0 <= mins <= 120 and 0 <= secs <= 59:
             total = mins * 60 + secs
-            if total > 0:
-                return total
-    return 0
+            if total > 0 and (best == 0 or total < best):
+                best = total
+    return best
+
+
+_TIMER_JS = """() => {
+  for (const el of document.querySelectorAll(
+    '[class*="timer"],[class*="Timer"],[class*="countdown"],[class*="Countdown"]'
+  )) {
+    const t = (el.innerText || '').trim();
+    if (/\\d{1,2}:\\d{2}/.test(t)) return t;
+  }
+  const body = document.body ? document.body.innerText : '';
+  if (/ERR_|No internet|net::/.test(body)) return '__NET_ERR__';
+  return body.slice(0, 1500);
+}"""
+
+
+async def get_timer_light(page) -> int:
+    """Read timer from page without scraping full article body."""
+    try:
+        text = await page.evaluate(_TIMER_JS)
+        if text == "__NET_ERR__":
+            return -1
+        if not text:
+            return 0
+        return parse_timer(text)
+    except Exception:
+        return -1
 
 
 async def get_timer(page) -> int:
-    try:
-        body = await page.inner_text("body")
-        if "ERR_" in body or "No internet" in body or "net::" in body:
-            return -1
-        return parse_timer(body)
-    except:
-        return -1
+    return await get_timer_light(page)
 
 
 async def get_progress(page) -> dict:
@@ -987,45 +1182,78 @@ async def wait_for_timer(
     hours_done: float, hours_today: float, hours_total: float,
     rs: Optional[RunState] = None,
 ):
-    """Poll timer, emit live status line, scroll keepalive every ~3 min."""
+    """Local wall-clock countdown; resync from page every TIMER_RESYNC_S with scroll."""
+    local = LocalTimer()
     elapsed = 0
-    last_scroll = 0
-    last_log = -1
+    since_resync = TIMER_RESYNC_S  # trigger initial DOM read immediately
+    last_log_min = -1
 
     while True:
-        secs = await get_timer(page)
-        if secs == 0:
-            log.info(f"[{phase}] ✓ timer expired — {lesson_title!r}")
-            sys.stderr.write("\n")
-            break
-        elif secs == -1:
-            log.warning(f"[{phase}] network error reading timer, retrying...")
-            await page.wait_for_timeout(POLL_INTERVAL_S * 1000)
-            elapsed += POLL_INTERVAL_S
+        if since_resync >= TIMER_RESYNC_S:
+            secs = await get_timer_light(page)
+            if secs == -1:
+                log.warning(f"[{phase}] network error reading timer, retrying in {LOCAL_TICK_S}s...")
+                await asyncio.sleep(LOCAL_TICK_S)
+                elapsed += LOCAL_TICK_S
+                since_resync += LOCAL_TICK_S
+                continue
+            if secs == 0:
+                log.info(f"[{phase}] ✓ timer expired — {lesson_title!r}")
+                clear_live_status()
+                break
+
+            if local.end_ts == 0:
+                local.set(secs)
+                live_status(phase, secs, lesson_title, hours_done, hours_today, hours_total, rs, force=True)
+                log_timer_sync(local, phase, lesson_title, hours_done, hours_today)
+            else:
+                await scroll_keepalive(page)
+                log.debug(f"[{phase}] ↕ scroll keepalive + timer resync at {elapsed // 60}min elapsed")
+                local.set(secs)
+                log_timer_sync(local, phase, lesson_title, hours_done, hours_today)
+            since_resync = 0
+
+        rem = local.remaining()
+        if local.end_ts > 0 and rem == 0:
+            verify = await get_timer_light(page)
+            if verify == 0:
+                log.info(f"[{phase}] ✓ timer expired — {lesson_title!r}")
+                clear_live_status()
+                break
+            if verify == -1:
+                log.warning(f"[{phase}] network error verifying expiry, retrying...")
+                await asyncio.sleep(LOCAL_TICK_S)
+                elapsed += LOCAL_TICK_S
+                since_resync += LOCAL_TICK_S
+                continue
+            if verify > 180:
+                log.info(f"[{phase}] ✓ timer expired — {lesson_title!r}")
+                clear_live_status()
+                break
+            local.set(verify)
+            log_timer_sync(local, phase, lesson_title, hours_done, hours_today)
+            since_resync = 0
             continue
 
-        live_status(phase, secs, lesson_title, hours_done, hours_today, hours_total, rs)
+        if local.end_ts > 0:
+            live_status(phase, rem, lesson_title, hours_done, hours_today, hours_total, rs)
 
-        mins_remaining = secs // 60
-        if mins_remaining != last_log and mins_remaining % 5 == 0:
-            log.info(f"[{phase}] ⏱ {mins_remaining}min remaining  {lesson_title!r}  today:{hours_today:.1f}h")
-            last_log = mins_remaining
-
-        log_event("timer_tick", phase=phase, timer_secs=secs,
-                  lesson_title=lesson_title, hours_done=hours_done, hours_today=hours_today)
-
-        if elapsed - last_scroll >= SCROLL_INTERVAL_S:
-            await scroll_keepalive(page)
-            last_scroll = elapsed
-            log.info(f"[{phase}] ↕ scroll keepalive at {elapsed//60}min elapsed")
+            mins_remaining = rem // 60
+            if mins_remaining != last_log_min and mins_remaining % 5 == 0:
+                log.debug(
+                    f"[{phase}] ⏱ {mins_remaining}min remaining  {lesson_title!r}  "
+                    f"today:{hours_today:.1f}h"
+                )
+                last_log_min = mins_remaining
 
         if elapsed > 95 * 60:
             log.warning(f"[{phase}] safety cap hit — moving on")
-            sys.stderr.write("\n")
+            clear_live_status()
             break
 
-        await page.wait_for_timeout(POLL_INTERVAL_S * 1000)
-        elapsed += POLL_INTERVAL_S
+        await asyncio.sleep(LOCAL_TICK_S)
+        elapsed += LOCAL_TICK_S
+        since_resync += LOCAL_TICK_S
 
 
 async def reading_phase(
@@ -1099,7 +1327,8 @@ async def reflect_phase(
             log.info("   Calling LLM for reflection...")
         reflection, reflection_source = call_agy(art_title, art_body, lesson_prompt)
 
-    log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
+    if not (pre_reflection and pre_reflection == reflection and pre_source == reflection_source):
+        log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
 
     filled_len = await fill_reflection_textarea(page, reflection)
 
@@ -1259,43 +1488,69 @@ async def get_user_profile(page) -> dict:
     return info
 
 
-def log_user_profile(user_info: dict, prog: dict):
+def load_bot_completed_titles() -> list[str]:
+    path = os.path.join(ROOT_DIR, "bot_completed_courses.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        courses = data.get("courses", data) if isinstance(data, dict) else data
+        titles = []
+        for c in courses:
+            if isinstance(c, dict):
+                t = c.get("title", "")
+            else:
+                t = str(c)
+            if t:
+                titles.append(t)
+        return titles
+    except Exception:
+        return []
+
+
+def log_user_profile(user_info: dict, prog: dict, hours_today: float = 0.0, catalog_done: int = 0):
     """Log structured user information banner upon login."""
+    clear_live_status()
+    rem_h = float(prog.get("remaining", 0) or 0)
+    done_h = float(prog.get("done", 0) or 0)
+    total_h = float(prog.get("total", 75) or 75)
+    pct = int((done_h / total_h) * 100) if total_h > 0 else 0
+    eta_label = format_eta_label(estimate_days_to_complete(rem_h, hours_today))
+
     log.info("╭────────────────────────────────────────────────────────╮")
-    log.info("│ 👤 USER ACCOUNT PROFILE & EDIT PROFILE DETAILS         │")
+    log.info("│ 👤 USER PROFILE                                        │")
     log.info("├────────────────────────────────────────────────────────┤")
 
     display_order = [
-        "FULL NAME", "Full Name",
-        "EMAIL (READ-ONLY)", "EMAIL", "Email",
-        "DATE OF BIRTH", "PHONE", "GENDER",
-        "REASON FOR COMMUNITY SERVICE", "COMMUNITY SERVICE RELATED TO",
-        "ADDRESS", "CITY", "STATE", "ZIP CODE",
+        "FULL NAME", "Full Name", "name",
+        "EMAIL (READ-ONLY)", "EMAIL", "Email", "email",
+        "DATE OF BIRTH", "dob", "PHONE", "GENDER",
+        "REASON FOR COMMUNITY SERVICE", "COMMUNITY SERVICE RELATED TO", "reason",
+        "ADDRESS", "address", "CITY", "STATE", "ZIP CODE",
         "PROBATION OFFICER", "COURT ID",
-        "ENROLLMENT PROOF ID", "Enrollment Proof ID",
-        "OFFICIAL ENROLLMENT PROOF PDF URL",
-        "COURT AUTHORIZATION LETTER LINK",
-        "CERTIFICATE VERIFICATION PORTAL LINK",
+        "ENROLLMENT PROOF ID", "Enrollment Proof ID", "enrollment_id",
+        "OFFICIAL ENROLLMENT PROOF PDF URL", "OFFICIAL PROOF PDF LINK",
+        "COURT AUTHORIZATION LETTER LINK", "CERTIFICATE VERIFICATION PORTAL LINK",
     ]
-
-    logged_keys = set()
+    logged_keys: set[str] = set()
     for key in display_order:
-        if key in user_info and key not in logged_keys:
-            val = user_info[key]
-            if val:
-                log.info(f"│ {key:<30}: {val}")
-                logged_keys.add(key)
+        if key in user_info and key not in logged_keys and user_info[key]:
+            log.info(f"│ {key:<30}: {str(user_info[key])[:80]}")
+            logged_keys.add(key)
 
-    for k, v in user_info.items():
-        if k not in logged_keys and v:
-            log.info(f"│ {k:<30}: {v}")
+    for k, v in sorted(user_info.items()):
+        if k not in logged_keys and v and k not in ("ts", "event", "date"):
+            log.info(f"│ {k:<30}: {str(v)[:80]}")
             logged_keys.add(k)
 
-    if prog:
-        pct = f"({prog.get('percent', 0)}% Complete)" if 'percent' in prog else ""
-        log.info(f"│ {'OVERALL PROGRESS':<30}: {prog.get('done', 0)}h / {prog.get('total', 75)}h total {pct}")
-        log.info(f"│ {'HOURS REMAINING':<30}: {prog.get('remaining', 0):.1f}h")
-
+    log.info("├────────────────────────────────────────────────────────┤")
+    log.info(f"│ {'Progress':<30}: {done_h:.1f}h / {total_h:.0f}h ({pct}%)")
+    log.info(f"│ {'Hours remaining':<30}: {rem_h:.1f}h")
+    log.info(f"│ {'Est. completion':<30}: {eta_label}")
+    log.info(f"│ {'Logged today':<30}: {hours_today:.1f}h / {DAILY_HOUR_LIMIT:.0f}h")
+    if catalog_done:
+        log.info(f"│ {'Lessons done on site':<30}: {catalog_done}")
     log.info("╰────────────────────────────────────────────────────────╯")
     prof_path = os.path.join(ROOT_DIR, "user_profile.json")
     try:
@@ -1304,6 +1559,60 @@ def log_user_profile(user_info: dict, prog: dict):
     except Exception as e:
         log.warning(f"Could not save user_profile.json: {e}")
     log_event("user_profile_loaded", **user_info)
+
+
+def log_catalog_summary(lessons: list, session_done: int = 0) -> None:
+    """Log coursework catalog snapshot at startup."""
+    done = sum(1 for l in lessons if l.status == "done")
+    cont = sum(1 for l in lessons if l.status == "continue")
+    start = sum(1 for l in lessons if l.status == "start")
+    clear_live_status()
+    log.info("╭────────────────────────────────────────────────────────╮")
+    log.info("│ 📚 COURSEWORK CATALOG                                  │")
+    log.info("├────────────────────────────────────────────────────────┤")
+    log.info(f"│ {'Total lessons':<24}: {len(lessons):>5}")
+    log.info(f"│ {'Completed on site':<24}: {done:>5}")
+    log.info(f"│ {'In progress':<24}: {cont:>5}")
+    log.info(f"│ {'Not started':<24}: {start:>5}")
+    if session_done:
+        log.info(f"│ {'Finished this session':<24}: {session_done:>5}")
+    upcoming = [l for l in lessons if l.status in ("continue", "start")][:3]
+    if upcoming:
+        log.info("├────────────────────────────────────────────────────────┤")
+        log.info("│ Up next:")
+        for i, lesson in enumerate(upcoming, 1):
+            t = lesson.title[:44] + ("…" if len(lesson.title) > 44 else "")
+            log.info(f"│   {i}. [{lesson.status:8}] {t}")
+    log.info("╰────────────────────────────────────────────────────────╯")
+
+
+def log_completion_breakdown(lessons: list) -> None:
+    """Show bot-completed vs site-completed lessons."""
+    bot_titles = load_bot_completed_titles()
+    bot_norm = {t.strip().lower() for t in bot_titles}
+    site_done = [l.title for l in lessons if l.status == "done"]
+    site_norm = {t.strip().lower() for t in site_done}
+
+    bot_only = [t for t in bot_titles if t.strip().lower() not in site_norm]
+    site_only = [t for t in site_done if t.strip().lower() not in bot_norm]
+    both = [t for t in bot_titles if t.strip().lower() in site_norm]
+
+    clear_live_status()
+    log.info("╭────────────────────────────────────────────────────────╮")
+    log.info("│ ✅ COMPLETION BREAKDOWN                                │")
+    log.info("├────────────────────────────────────────────────────────┤")
+    log.info(f"│ {'Completed on site (catalog)':<30}: {len(site_done):>5}")
+    log.info(f"│ {'Completed by this bot':<30}: {len(bot_titles):>5}")
+    log.info(f"│ {'Bot + site (matched)':<30}: {len(both):>5}")
+    log.info(f"│ {'Bot only (not yet on site)':<30}: {len(bot_only):>5}")
+    log.info(f"│ {'Site only (not by bot)':<30}: {len(site_only):>5}")
+
+    if bot_titles:
+        log.info("├────────────────────────────────────────────────────────┤")
+        log.info("│ Last completed by bot:")
+        for i, t in enumerate(bot_titles[-5:], 1):
+            log.info(f"│   {i}. {t[:52]}{'…' if len(t) > 52 else ''}")
+    log.info("╰────────────────────────────────────────────────────────╯")
 
 
 async def check_site_reset_with_reauth(page) -> dict:
@@ -1354,15 +1663,19 @@ async def wait_for_daily_reset(page, rs: RunState):
     last_scroll_time = time.time()
 
     pre_midnight_checked = False
+    last_limit_status_min = -1
 
     while True:
         now = datetime.now()
         secs_remaining = max(0, int((tomorrow - now).total_seconds()))
 
-        live_status(
-            "LIMIT_WAIT", secs_remaining, "Daily Limit Reached - Waiting for Reset",
-            rs.hours_done, rs.hours_today, rs.hours_total, rs
-        )
+        limit_min = secs_remaining // 60
+        if limit_min != last_limit_status_min:
+            live_status(
+                "LIMIT_WAIT", secs_remaining, "Daily Limit — midnight reset",
+                rs.hours_done, rs.hours_today, rs.hours_total, rs, force=True,
+            )
+            last_limit_status_min = limit_min
 
         if time.time() - last_notify_time >= 600:
             last_notify_time = time.time()
@@ -1392,14 +1705,13 @@ async def wait_for_daily_reset(page, rs: RunState):
                 break
             else:
                 log.info("⏳ Midnight reached, but site hasn't updated yet. Checking every 15 minutes (12:15 AM, 12:30 AM...)...")
-                # Wait 15 minutes (900 seconds) between post-midnight re-checks
-                for _ in range(36): # 36 x 25s = 900s (15 min)
+                for _ in range(15):  # 15 x 60s = 900s (15 min)
                     now_post = datetime.now()
                     live_status(
                         "LIMIT_WAIT", 0, "Midnight Passed - Retrying every 15m",
                         rs.hours_done, rs.hours_today, rs.hours_total, rs
                     )
-                    await page.wait_for_timeout(25000)
+                    await asyncio.sleep(LOCAL_TICK_S)
 
                 log.info("🔍 15-minute post-midnight check: inspecting daily limit status on site...")
                 daily_retry = await check_site_reset_with_reauth(page)
@@ -1419,7 +1731,7 @@ async def wait_for_daily_reset(page, rs: RunState):
             except Exception:
                 pass
 
-        await page.wait_for_timeout(25000)
+        await asyncio.sleep(LOCAL_TICK_S)
 
     log_event("daily_limit_wait_complete", waited_seconds=int(time.time() - start_time))
 
@@ -1542,21 +1854,31 @@ def rotate_logs_if_large():
 
 
 async def main():
+    try:
+        import telegram_notify
+        telegram_notify.start()
+    except Exception as e:
+        log.warning("Telegram runtime skipped: %s", e)
+    await _main_inner()
+
+
+async def _main_inner():
     global RUN_STATE
 
     log.info("╭────────────────────────────────────────────────────────╮")
     log.info(f"│ TFC Bot v4  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S'):<31} │")
     log.info("├────────────────────────────────────────────────────────┤")
-    log.info("│ Catalog discovery | state verify | agy reflections     │")
+    log.info("│ Startup: login → progress → profile → catalog → run    │")
     log.info("╰────────────────────────────────────────────────────────╯")
 
     log_event("bot_start", version=4)
     rotate_logs_if_large()
 
     hours_today_start = get_today_hours_from_log()
-    log.info(f"📅 Hours logged today (from events.jsonl): {hours_today_start:.1f}h")
+    log.info(f"📅 Hours logged today (events): {hours_today_start:.1f}h")
 
     async with async_playwright() as p:
+        log.info("🌐 Launching browser...")
         browser = await p.chromium.launch(
             headless=not bool(os.getenv("HEADED")),
             args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--blink-settings=imagesEnabled=true"],
@@ -1570,33 +1892,56 @@ async def main():
         )
         page = await ctx.new_page()
 
+        log.info("🔐 Authenticating...")
         if not await ensure_auth(page):
             log.error("Auth failed. Exiting.")
             await page.close()
             await ctx.close()
             await browser.close()
             sys.exit(1)
+        log.info("   ✓ Logged in")
 
+        log.info("📊 Loading dashboard progress...")
         prog = await get_progress(page)
         log_event("progress_snapshot", **prog)
+        log.info(f"   ✓ {prog['done']:.1f}h / {prog['total']:.0f}h ({prog['remaining']:.1f}h remaining)")
 
-        user_info = await get_user_profile(page)
-        log_user_profile(user_info, prog)
-
+        log.info("📅 Checking daily hour limit...")
         daily = await get_daily_status(page)
         hours_today = daily["hours_today"]
         hours_remaining_today = daily["hours_remaining_today"]
         log.info(
-            f"📅 Today: {hours_today:.1f}h done, {hours_remaining_today:.1f}h left "
+            f"   ✓ Today {hours_today:.1f}h used, {hours_remaining_today:.1f}h left "
             f"(source: {daily['source']})"
         )
+
+        log.info("👤 Loading user profile...")
+        user_info = await get_user_profile(page)
+        log.info("   ✓ Profile loaded")
+
+        log.info("📚 Scraping coursework catalog...")
+        lessons, _cta_url = await fetch_coursework_catalog(page)
+        catalog_done = sum(1 for l in lessons if l.status == "done")
+        log.info(f"   ✓ {len(lessons)} lessons ({catalog_done} done on site)")
+
+        log_user_profile(user_info, prog, hours_today, catalog_done)
+        log_catalog_summary(lessons)
+        log_completion_breakdown(lessons)
 
         rs = RUN_STATE
         rs.hours_done = prog["done"]
         rs.hours_total = prog["total"]
+        rs.hours_remaining = prog["remaining"]
         rs.hours_today = hours_today
+        rs.catalog_done = catalog_done
+        rs.queue_total = len(lessons)
+        rs.user_name = (
+            user_info.get("FULL NAME") or user_info.get("Full Name") or user_info.get("name") or ""
+        ).strip()
 
         if check_daily_limit(hours_today, hours_remaining_today):
+            rs.phase = "LIMIT_WAIT"
+            rs.title = "Daily limit — waiting for midnight reset"
             await wait_for_daily_reset(page, rs)
 
         CAFFEINATE_MANAGER.start()
@@ -1649,7 +1994,7 @@ async def main():
             rs.queue_pos = rs.catalog_done + session_done + 1
             rs.title = lesson.title
             rs.phase = "START"
-            live_status("START", 0, lesson.title, rs.hours_done, hours_today, rs.hours_total, rs)
+            live_status("START", 0, lesson.title, rs.hours_done, hours_today, rs.hours_total, rs, force=True)
 
             log.info(f"\n{'─'*55}")
             log.info(
@@ -1718,4 +2063,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    write_bot_pid()
+    try:
+        asyncio.run(main())
+    finally:
+        remove_bot_pid()

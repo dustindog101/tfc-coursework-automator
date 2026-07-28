@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import re
+import math
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -18,11 +19,61 @@ import socket
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 EVENTS_FILE = os.path.join(ROOT_DIR, "events.jsonl")
+# Skip when loading events.jsonl (keeps timer/reflection events for live UI)
+_EVENTS_SKIP_LOAD = frozenset({"scroll_keepalive"})
+# Skip in history submenu (draft/timer shown elsewhere)
+_HISTORY_SKIP_EVENTS = frozenset({
+    "scroll_keepalive", "timer_sync", "timer_tick", "reflection_generated",
+})
 LOG_FILE = os.path.join(ROOT_DIR, "automation.log")
+BOT_PID_FILE = os.path.join(ROOT_DIR, "bot.pid")
 COMPLETED_COURSES_FILE = os.path.join(ROOT_DIR, "completed_courses.json")
 SCRIPT_PATH = os.path.join(ROOT_DIR, "run_courses.py")
 ENV_FILE = os.path.join(ROOT_DIR, ".env")
 LAUNCH_AGENT_PATH = os.path.expanduser("~/Library/LaunchAgents/com.tfc.automator.plist")
+
+BOT_START_GRACE_S = 25
+BOT_RESTART_COOLDOWN_S = 60
+WATCHDOG_MAX_RESTARTS = 3
+WATCHDOG_RESTART_WINDOW_S = 300
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _read_bot_pid_file() -> int | None:
+    try:
+        with open(BOT_PID_FILE, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _remove_bot_pid_file() -> None:
+    try:
+        if os.path.exists(BOT_PID_FILE):
+            os.remove(BOT_PID_FILE)
+    except Exception:
+        pass
+
+
+_MALLOC_ENV_KEYS = (
+    "MallocStackLogging", "MallocStackLoggingNoCompact", "MallocScribble",
+    "MallocGuardEdges", "MALLOC_STACK_LOGGING",
+)
+
+
+def _subprocess_env(extra=None) -> dict:
+    env = os.environ.copy()
+    for key in _MALLOC_ENV_KEYS:
+        env.pop(key, None)
+    if extra:
+        env.update(extra)
+    return env
 
 _SINGLE_INSTANCE_LOCK_SOCKET = None
 
@@ -50,6 +101,35 @@ def format_local_time(ts_iso_str: str) -> str:
         return ts_iso_str
 
 
+def format_timer_remaining(end_ts: float) -> str:
+    """Format a countdown from a wall-clock end timestamp."""
+    if end_ts <= 0:
+        return "N/A"
+    secs = max(0, int(end_ts - time.time()))
+    if secs <= 0:
+        return "N/A"
+    mins, s = secs // 60, secs % 60
+    return f"{mins}m {s}s" if s else f"{mins}m"
+
+
+def estimate_days_to_complete(hours_remaining: float, hours_today: float = 0.0, daily_limit: float = 8.0) -> int:
+    if hours_remaining <= 0:
+        return 0
+    avail_today = max(0.0, daily_limit - hours_today)
+    if hours_remaining <= avail_today:
+        return 0
+    after_today = hours_remaining - avail_today
+    return int(math.ceil(after_today / daily_limit))
+
+
+def format_eta_label(days: int) -> str:
+    if days <= 0:
+        return "finish today"
+    if days == 1:
+        return "~1 day"
+    return f"~{days} days"
+
+
 class TFCCourseworkMenuApp(rumps.App):
     def __init__(self):
         super(TFCCourseworkMenuApp, self).__init__(
@@ -74,7 +154,19 @@ class TFCCourseworkMenuApp(rumps.App):
         self.watchdog_enabled = True   # Watchdog active by default
         self.user_paused = False       # Tracks if user manually paused bot
         self.last_crash_time = 0.0
+        self._watchdog_suppressed_until = 0.0
+        self._bot_pid: int | None = None
+        self._last_bot_start_time = 0.0
+        self._watchdog_restart_times: list[float] = []
+        self._watchdog_backoff_logged = False
+        self._watchdog_armed = False
         self.display_mode = "auto"     # auto, timers, progress, full, minimal
+        self._read_timer_end = 0.0
+        self._reflect_timer_end = 0.0
+        self._events_cache = []
+        self._events_mtime = 0.0
+        self._log_mtime = 0.0
+        self._log_state = {}
 
         # ── 1. Status ──────────────────────────────────────────
         self.item_status = rumps.MenuItem("⚙️ Initializing...", callback=None)
@@ -127,11 +219,12 @@ class TFCCourseworkMenuApp(rumps.App):
 
         self.item_prof_progress = rumps.MenuItem("📊 Total Progress: Calculating...")
         self.item_prof_remaining = rumps.MenuItem("• Remaining Hours: 56.2h")
+        self.item_prof_eta = rumps.MenuItem("• Est. Days to Complete: —")
         self.menu_profile.update([
             self.item_prof_name, self.item_prof_email, self.item_prof_dob,
             self.item_prof_cat, self.item_prof_addr, self.item_prof_id, None,
             self.item_copy_proof, self.item_copy_court, self.item_copy_portal, None,
-            self.item_prof_progress, self.item_prof_remaining
+            self.item_prof_progress, self.item_prof_remaining, self.item_prof_eta
         ])
         
         # ── 6. Live Event History ────────────────────────────────────────────
@@ -143,6 +236,7 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_set_headed = rumps.MenuItem("👁️ Browser Mode Toggle: Headless", callback=self.toggle_headed)
         self.item_set_autostart = rumps.MenuItem("🚀 macOS Start on Login: OFF", callback=self.toggle_autostart)
         self.item_set_watchdog = rumps.MenuItem("🛡️ Watchdog Auto-Restart Toggle: ON", callback=self.toggle_watchdog)
+        self.item_set_telegram = rumps.MenuItem("📱 Telegram Notifications: OFF", callback=self.toggle_telegram)
         self.item_set_caffeinate = rumps.MenuItem("☕ Smart Caffeinate: ON", callback=self.toggle_caffeinate)
         self.item_set_display = rumps.MenuItem("📺 Title Display Mode: Auto", callback=self.cycle_display_mode)
         self.item_set_env = rumps.MenuItem("✏️ Edit Credentials (.env)", callback=self.edit_env)
@@ -150,6 +244,7 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_set_headed,
             self.item_set_autostart,
             self.item_set_watchdog,
+            self.item_set_telegram,
             self.item_set_caffeinate,
             self.item_set_display,
             None,
@@ -160,7 +255,8 @@ class TFCCourseworkMenuApp(rumps.App):
         self.item_bot_toggle = rumps.MenuItem("▶️ Start Automator Engine", callback=self.toggle_bot)
         self.item_open_dashboard = rumps.MenuItem("🌐 Open TFC Dashboard", callback=self.open_dashboard)
         self.item_view_log = rumps.MenuItem("📋 Open Log File", callback=self.open_log)
-        self.item_quit = rumps.MenuItem("❌ Quit", callback=rumps.quit_application)
+        self.item_quit_menubar = rumps.MenuItem("Close Menubar Only (bot keeps running)", callback=self.quit_menubar_only)
+        self.item_quit_all = rumps.MenuItem("Quit All (Menubar + Bot)", callback=self.quit_all)
         
         # Assemble Menu Layout
         self.menu = [
@@ -178,11 +274,17 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_open_dashboard,
             self.item_view_log,
             None,
-            self.item_quit
+            self.item_quit_menubar,
+            self.item_quit_all,
         ]
         
         # Check start on login state
         self.sync_autostart_ui()
+        self.sync_telegram_ui()
+
+        # Start bot before first UI poll — avoids watchdog firing during init
+        self.ensure_bot_running_on_start()
+        self._watchdog_armed = True
 
         # Initial state update (instant UI populate)
         try:
@@ -190,61 +292,128 @@ class TFCCourseworkMenuApp(rumps.App):
         except Exception:
             pass
 
-        # Auto-launch bot process in Headless mode by default
-        self.ensure_bot_running_on_start()
-
     def is_bot_running(self):
-        """Check if python3 run_courses.py is currently executing."""
-        try:
-            res = subprocess.run(["pgrep", "-f", "run_courses.py"], capture_output=True, text=True)
-            if res.returncode == 0 and res.stdout.strip():
+        """Check if run_courses.py is currently executing."""
+        if self._bot_pid and _pid_alive(self._bot_pid):
+            return True
+        pid = _read_bot_pid_file()
+        if pid:
+            if _pid_alive(pid):
+                self._bot_pid = pid
                 return True
+            _remove_bot_pid_file()
+        if self._bot_pid and _pid_alive(self._bot_pid):
+            return True
+        self._bot_pid = None
+        for pattern in ("run_courses.py",):
+            try:
+                res = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True, text=True,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    self._bot_pid = int(res.stdout.strip().splitlines()[0])
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def stop_bot_process(self, *, user_initiated: bool = True) -> bool:
+        """Stop run_courses.py and suppress watchdog restarts."""
+        if user_initiated:
+            self.user_paused = True
+            self._watchdog_suppressed_until = time.time() + 300
+        pid = _read_bot_pid_file() or self._bot_pid
+        if pid and _pid_alive(pid):
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        try:
+            subprocess.run(["pkill", "-f", "run_courses.py"], check=False)
+            for _ in range(24):
+                if not self.is_bot_running():
+                    _remove_bot_pid_file()
+                    self._bot_pid = None
+                    self.update_toggle_button()
+                    return True
+                time.sleep(0.25)
+            subprocess.run(["pkill", "-9", "-f", "run_courses.py"], check=False)
+            time.sleep(0.5)
         except Exception:
             pass
-        return False
+        _remove_bot_pid_file()
+        self._bot_pid = None
+        self.update_toggle_button()
+        return not self.is_bot_running()
 
     def start_bot_process(self):
         """Start run_courses.py process in background."""
-        env = os.environ.copy()
+        if self.is_bot_running():
+            self._last_bot_start_time = time.time()
+            return
+        self.user_paused = False
+        self._watchdog_suppressed_until = 0.0
+        env = _subprocess_env()
         if self.headed_mode:
             env["HEADED"] = "1"
         else:
             env.pop("HEADED", None)
-            
-        subprocess.Popen(["python3", "-u", SCRIPT_PATH], cwd=ROOT_DIR, env=env)
-        self.user_paused = False
+
+        proc = subprocess.Popen(
+            ["python3", "-u", SCRIPT_PATH],
+            cwd=ROOT_DIR,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._bot_pid = proc.pid
+        self._last_bot_start_time = time.time()
 
     def ensure_bot_running_on_start(self):
-        """Auto-start the automation engine in headless mode by default."""
-        if not self.is_bot_running():
-            try:
-                self.start_bot_process()
-                rumps.notification(
-                    "TFC Automator",
-                    "Automator Engine Started",
-                    "Coursework bot is running in background Headless mode."
-                )
-            except Exception as e:
-                print(f"Could not auto-start bot: {e}")
+        """Start bot on menubar launch if not already running."""
+        if self.is_bot_running():
+            self._last_bot_start_time = time.time()
+            pid = self._bot_pid or _read_bot_pid_file() or "?"
+            print(
+                f"✅ Bot already running (pid {pid}) — background process from a prior session"
+            )
+            print(
+                "   (Menubar Ctrl+C / Close Menubar Only does not stop the bot.)"
+            )
+            print("   Live log streams below, or: tail -f automation.log")
+            self.user_paused = False
+            self.update_toggle_button()
+            return
+        try:
+            self.start_bot_process()
+            pid = self._bot_pid or _read_bot_pid_file() or "?"
+            print(f"✅ Bot started (pid {pid}) — live log streams below")
+            rumps.notification(
+                "TFC Automator",
+                "Automator Engine Started",
+                "Coursework bot is running. See automation.log for details.",
+            )
+        except Exception as e:
+            print(f"Could not auto-start bot: {e}")
         self.update_toggle_button()
 
     def update_toggle_button(self):
         """Sync UI toggle labels with active state."""
         bot_running = self.is_bot_running()
         if bot_running:
-            self.item_bot_toggle.title = "⏸️ Pause Automator Engine"
+            self.item_bot_toggle.title = "⏹️ Stop Automator Engine"
         else:
             self.item_bot_toggle.title = "▶️ Start Automator Engine"
 
     def toggle_bot(self, _):
         """Start or pause the run_courses.py process."""
         if self.is_bot_running():
-            try:
-                self.user_paused = True
-                subprocess.run(["pkill", "-f", "run_courses.py"])
-                rumps.notification("TFC Automator", "Automator Paused ⏸️", "Coursework process has been paused.")
-            except Exception as e:
-                rumps.alert(f"Error pausing bot: {e}")
+            if self.stop_bot_process(user_initiated=True):
+                rumps.notification("TFC Automator", "Automator Stopped ⏸️", "Coursework bot fully stopped.")
+            else:
+                rumps.alert("Could not fully stop the bot. Try Quit All or run: pkill -f run_courses.py")
         else:
             try:
                 self.start_bot_process()
@@ -253,6 +422,15 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception as e:
                 rumps.alert(f"Error starting bot: {e}")
         self.update_toggle_button()
+
+    def quit_menubar_only(self, _):
+        """Close menubar; leave bot running in background."""
+        rumps.quit_application()
+
+    def quit_all(self, _):
+        """Stop bot and close menubar."""
+        self.stop_bot_process(user_initiated=True)
+        rumps.quit_application()
 
     def toggle_headed(self, _):
         """Toggle browser visibility mode (Headless vs Headed)."""
@@ -267,7 +445,7 @@ class TFCCourseworkMenuApp(rumps.App):
         # Restart bot process with new mode if active
         if self.is_bot_running():
             try:
-                subprocess.run(["pkill", "-f", "run_courses.py"])
+                self.stop_bot_process(user_initiated=False)
                 time.sleep(1)
                 self.start_bot_process()
             except Exception:
@@ -330,6 +508,36 @@ class TFCCourseworkMenuApp(rumps.App):
         else:
             self.item_set_watchdog.title = "🛡️ Watchdog Auto-Restart Toggle: OFF"
             rumps.notification("TFC Settings", "Watchdog Disabled", "Automatic crash restart disabled.")
+
+    def sync_telegram_ui(self):
+        """Sync Telegram menu label with runtime settings."""
+        try:
+            import telegram_notify
+            telegram_notify.ensure_settings_file()
+            on = telegram_notify.is_enabled()
+        except Exception:
+            on = False
+        self.item_set_telegram.title = (
+            "📱 Telegram Notifications: ON" if on else "📱 Telegram Notifications: OFF"
+        )
+
+    def toggle_telegram(self, _):
+        """Enable or disable Telegram push notifications."""
+        try:
+            import telegram_notify
+            telegram_notify.ensure_settings_file()
+            new_state = not telegram_notify.is_enabled()
+            telegram_notify.set_enabled(new_state)
+            self.sync_telegram_ui()
+            if new_state:
+                rumps.notification(
+                    "TFC Settings", "Telegram ON 📱",
+                    "Push notifications enabled. Message /start to your bot if not linked yet.",
+                )
+            else:
+                rumps.notification("TFC Settings", "Telegram OFF", "Push notifications disabled.")
+        except Exception as e:
+            rumps.alert(f"Telegram settings error: {e}")
 
     def toggle_caffeinate(self, _):
         """Toggle Smart Caffeinate power management setting."""
@@ -421,37 +629,126 @@ class TFCCourseworkMenuApp(rumps.App):
         except Exception:
             pass
 
+    def _scan_log_state(self) -> dict:
+        """Parse automation.log tail once; caller caches by mtime."""
+        state = {
+            "read_timer": "N/A",
+            "reflect_timer": "N/A",
+            "limit_timer": "N/A",
+            "log_limit_wait": False,
+            "retrying_after_midnight": False,
+            "lesson": "",
+            "progress": None,
+        }
+        if not os.path.exists(LOG_FILE):
+            return state
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                for line in reversed(deque(f, maxlen=500)):
+                    m_prog = re.search(
+                        r"TFC\s+(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)h|(\d+(?:\.\d+)?)h\s*/\s*(\d+(?:\.\d+)?)h",
+                        line,
+                    )
+                    if m_prog and state["progress"] is None:
+                        d_val = float(m_prog.group(1) or m_prog.group(3))
+                        t_val = float(m_prog.group(2) or m_prog.group(4))
+                        if d_val > 0:
+                            state["progress"] = (d_val, t_val)
+
+                    if "retrying in 2 minutes" in line or "Reset not updated on site yet" in line:
+                        state["retrying_after_midnight"] = True
+                    if "[LIMIT_WAIT]" in line or "LIMIT REACHED" in line:
+                        state["log_limit_wait"] = True
+                        m_rem = re.search(r"⏱\s*(\d+h\s*\d+m)", line)
+                        if m_rem:
+                            state["limit_timer"] = m_rem.group(1)
+                        break
+                    if "[READ]" in line or "[REFLECT]" in line:
+                        state["log_limit_wait"] = False
+                        m_l = re.search(r"Lesson #[^\s']+", line)
+                        if m_l:
+                            state["lesson"] = m_l.group(0)
+                        m_t = re.search(r"⏱\s*(\d+min(?:\s*remaining)?|\d+:\d+|\d+h\s*\d+m)", line)
+                        if m_t:
+                            parsed_time = (
+                                m_t.group(1).replace("min remaining", "m").replace("min", "m").strip()
+                            )
+                            if "[READ]" in line:
+                                state["read_timer"] = parsed_time
+                            else:
+                                state["reflect_timer"] = parsed_time
+                        break
+        except Exception:
+            pass
+        return state
+
     @rumps.timer(1)
     def update_state(self, _):
         """Polled every 1 second: monitors runner, watchdog, events.jsonl & automation.log."""
         bot_active = self.is_bot_running()
         self.update_toggle_button()
         
-        # Lightweight Watchdog Check (if enabled & not explicitly paused by user)
-        if self.watchdog_enabled and not self.user_paused and not bot_active:
+        # Watchdog: auto-restart on crash only (not after manual stop)
+        in_start_grace = (
+            self._last_bot_start_time > 0
+            and time.time() - self._last_bot_start_time < BOT_START_GRACE_S
+        )
+        if (
+            self._watchdog_armed
+            and self.watchdog_enabled
+            and not self.user_paused
+            and not bot_active
+            and not in_start_grace
+            and time.time() >= self._watchdog_suppressed_until
+        ):
             now_ts = time.time()
-            if now_ts - self.last_crash_time > 5.0:
+            self._watchdog_restart_times = [
+                t for t in self._watchdog_restart_times
+                if now_ts - t < WATCHDOG_RESTART_WINDOW_S
+            ]
+            if len(self._watchdog_restart_times) >= WATCHDOG_MAX_RESTARTS:
+                if not self._watchdog_backoff_logged:
+                    print(
+                        "🛡️ Watchdog: too many restarts — backing off "
+                        "(use ▶️ Start or restart menubar)"
+                    )
+                    self._watchdog_backoff_logged = True
+            elif now_ts - self.last_crash_time >= BOT_RESTART_COOLDOWN_S:
                 self.last_crash_time = now_ts
+                self._watchdog_restart_times.append(now_ts)
+                self._watchdog_backoff_logged = False
                 print("🛡️ Watchdog: restarting automation engine in background...")
                 try:
                     self.start_bot_process()
                     bot_active = True
-                    rumps.notification("TFC Watchdog 🛡️", "Engine Restarted", "Watchdog automatically restarted coursework engine.")
+                    rumps.notification(
+                        "TFC Watchdog 🛡️", "Engine Restarted",
+                        "Watchdog automatically restarted coursework engine.",
+                    )
                 except Exception as e:
                     print(f"Watchdog restart failed: {e}")
 
-        # 1. Parse events.jsonl
-        events = []
+        # 1. Parse events.jsonl (skip re-read when file unchanged)
+        events = self._events_cache
         if os.path.exists(EVENTS_FILE):
             try:
-                with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-                    for line in deque(f, maxlen=500):
-                        line = line.strip()
-                        if line:
-                            try:
-                                events.append(json.loads(line))
-                            except Exception:
-                                pass
+                mtime = os.path.getmtime(EVENTS_FILE)
+                if mtime != self._events_mtime:
+                    self._events_mtime = mtime
+                    loaded = []
+                    with open(EVENTS_FILE, "r", encoding="utf-8") as f:
+                        for line in deque(f, maxlen=500):
+                            line = line.strip()
+                            if line:
+                                try:
+                                    ev = json.loads(line)
+                                    if ev.get("event") in _EVENTS_SKIP_LOAD:
+                                        continue
+                                    loaded.append(ev)
+                                except Exception:
+                                    pass
+                    self._events_cache = loaded
+                    events = loaded
             except Exception:
                 pass
                 
@@ -501,26 +798,35 @@ class TFCCourseworkMenuApp(rumps.App):
                     self.site_completed = ev.get("done", 0)
                     break
                         
-            # Latest timer_tick
+            # Latest timer_sync (or legacy timer_tick); menubar interpolates between syncs
             for ev in reversed(events):
-                if ev.get("event") == "timer_tick":
-                    timer_secs = ev.get("timer_secs", 0)
-                    phase = ev.get("phase", "")
-                    lesson_title = ev.get("lesson_title", "")
-                    if lesson_title:
-                        self.current_lesson = lesson_title
-                        
-                    mins = timer_secs // 60
-                    secs = timer_secs % 60
-                    if secs > 0:
-                        fmt_time = f"{mins}m {secs}s"
-                    else:
-                        fmt_time = f"{mins}m"
-                        
-                    if phase == "READ":
-                        read_timer_str = fmt_time
-                    elif phase == "REFLECT":
-                        submit_timer_str = fmt_time
+                if ev.get("event") not in ("timer_sync", "timer_tick"):
+                    continue
+                timer_secs = ev.get("timer_secs", 0)
+                phase = ev.get("phase", "")
+                lesson_title = ev.get("lesson_title", "")
+                if lesson_title:
+                    self.current_lesson = lesson_title
+                timer_end_at = ev.get("timer_end_at", "")
+                if timer_end_at:
+                    try:
+                        end_ts = datetime.fromisoformat(timer_end_at).timestamp()
+                    except Exception:
+                        end_ts = time.time() + max(0, int(timer_secs))
+                else:
+                    end_ts = time.time() + max(0, int(timer_secs))
+                if phase == "READ":
+                    self._read_timer_end = end_ts
+                    self._reflect_timer_end = 0.0
+                elif phase == "REFLECT":
+                    self._reflect_timer_end = end_ts
+                    self._read_timer_end = 0.0
+                break
+
+            for ev in reversed(events):
+                if ev.get("event") in ("lesson_complete", "daily_limit_wait_start", "daily_limit_hit"):
+                    self._read_timer_end = 0.0
+                    self._reflect_timer_end = 0.0
                     break
                         
             # Get today's hours if available (date matching today)
@@ -535,39 +841,46 @@ class TFCCourseworkMenuApp(rumps.App):
                         
             # Event history items formatted in 12-hour local time
             history_items = []
+            seen_history = set()
+
+            def _add_history(item: str) -> None:
+                if item in seen_history or len(history_items) >= 10:
+                    return
+                seen_history.add(item)
+                history_items.append(item)
+
             for ev in reversed(events):
                 if len(history_items) >= 10:
                     break
-                
+                event_name = ev.get("event", "event")
+                if event_name in _HISTORY_SKIP_EVENTS:
+                    continue
+
                 time_str = format_local_time(ev.get("ts", ""))
                 t_prefix = f"[{time_str}] " if time_str else ""
-                event_name = ev.get("event", "event")
-                
+
                 if event_name == "user_profile_loaded":
-                    history_items.append(f"{t_prefix}👤 Profile Loaded")
+                    _add_history(f"{t_prefix}👤 Profile Loaded")
                 elif event_name == "progress_snapshot":
-                    history_items.append(f"{t_prefix}📊 Progress Snapshot ({ev.get('done')}h/{ev.get('total')}h)")
+                    _add_history(f"{t_prefix}📊 Progress Snapshot ({ev.get('done')}h/{ev.get('total')}h)")
                 elif event_name == "lesson_start":
-                    history_items.append(f"{t_prefix}📖 Started Lesson: {ev.get('lesson_title', 'Lesson')[:25]}")
+                    _add_history(f"{t_prefix}📖 Started Lesson: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "reading_start":
-                    history_items.append(f"{t_prefix}📖 Reading: {ev.get('lesson_title', 'Lesson')[:25]}")
+                    _add_history(f"{t_prefix}📖 Reading: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "reflect_start":
-                    history_items.append(f"{t_prefix}✍️ Reflecting: {ev.get('lesson_title', 'Lesson')[:25]}")
-                elif event_name == "reflection_generated":
-                    src = ev.get("source", "?")
-                    history_items.append(f"{t_prefix}📝 AI Reflection Ready [{src}] ({ev.get('chars')} chars)")
+                    _add_history(f"{t_prefix}✍️ Reflecting: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "reflect_submitted":
-                    history_items.append(f"{t_prefix}📤 Submitted Reflection: {ev.get('lesson_title', 'Lesson')[:25]}")
+                    _add_history(f"{t_prefix}📤 Submitted Reflection: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "lesson_complete":
-                    history_items.append(f"{t_prefix}✅ Completed: {ev.get('lesson_title', 'Lesson')[:25]}")
+                    _add_history(f"{t_prefix}✅ Completed: {ev.get('lesson_title', 'Lesson')[:25]}")
                 elif event_name == "daily_limit_hit":
-                    history_items.append(f"{t_prefix}⛔ Daily Limit Hit ({ev.get('hours_today')}h/8.0h)")
+                    _add_history(f"{t_prefix}⛔ Daily Limit Hit ({ev.get('hours_today')}h/8.0h)")
                 elif event_name == "daily_limit_wait_start":
-                    history_items.append(f"{t_prefix}🌙 Waiting for Midnight Reset")
+                    _add_history(f"{t_prefix}🌙 Waiting for Midnight Reset")
                 elif event_name == "daily_limit_reset_detected":
-                    history_items.append(f"{t_prefix}🌅 Midnight Reset Detected")
+                    _add_history(f"{t_prefix}🌅 Midnight Reset Detected")
                 elif event_name == "bot_start":
-                    history_items.append(f"{t_prefix}🚀 Bot Engine Started")
+                    _add_history(f"{t_prefix}🚀 Bot Engine Started")
 
             # Fallback: fill history from automation.log if events are sparse
             if len(history_items) < 5 and os.path.exists(LOG_FILE):
@@ -731,18 +1044,26 @@ class TFCCourseworkMenuApp(rumps.App):
         rem = self.progress.get("remaining", 0.0)
         pct = int((done / total) * 100) if total else 0
         
+        try:
+            hrs_today_f = float(getattr(self, "hours_today", 0.0))
+        except (ValueError, TypeError):
+            hrs_today_f = 0.0
+
         filled = int(round((pct / 100) * 10)) if total else 0
         filled = max(0, min(10, filled))
         bar = "█" * filled + "░" * (10 - filled)
         
         self.item_prof_progress.title = f"📊 Total Progress: [{bar}] {pct}% ({done} / {total}h)"
         self.item_prof_remaining.title = f"• Remaining Hours: {rem:.1f}h"
+        eta_days = estimate_days_to_complete(rem, hrs_today_f)
+        self.item_prof_eta.title = f"• Est. Days to Complete: {format_eta_label(eta_days)}"
+        site_done = getattr(self, "site_completed", 0) or all_count
+        if site_done:
+            self.item_prof_progress.title += f" │ {site_done} courses done"
 
-        # 4. Parse automation.log for live lesson, phase & timers
-        if "read_timer_str" not in locals():
-            read_timer_str = "N/A"
-        if "submit_timer_str" not in locals():
-            submit_timer_str = "N/A"
+        # 4. Timers: smooth local countdown; log scan cached by mtime
+        read_timer_str = format_timer_remaining(self._read_timer_end)
+        submit_timer_str = format_timer_remaining(self._reflect_timer_end)
         limit_timer_str = "N/A"
         is_limit_wait = False
         log_limit_wait = False
@@ -750,39 +1071,28 @@ class TFCCourseworkMenuApp(rumps.App):
 
         if os.path.exists(LOG_FILE):
             try:
-                with open(LOG_FILE, "r", encoding="utf-8") as f:
-                    for line in reversed(deque(f, maxlen=500)):
-                        # Live progress hours from log (e.g. "TFC 26.8/75h" or "26.8h / 75h")
-                        m_prog = re.search(r"TFC\s+(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)h|(\d+(?:\.\d+)?)h\s*/\s*(\d+(?:\.\d+)?)h", line)
-                        if m_prog:
-                            d_val = float(m_prog.group(1) or m_prog.group(3))
-                            t_val = float(m_prog.group(2) or m_prog.group(4))
-                            if d_val > 0:
-                                self.progress["done"] = d_val
-                                self.progress["total"] = t_val
-                                self.progress["remaining"] = max(0.0, t_val - d_val)
-
-                        if "retrying in 2 minutes" in line or "Reset not updated on site yet" in line:
-                            is_retrying_after_midnight = True
-                        if "[LIMIT_WAIT]" in line or "LIMIT REACHED" in line:
-                            log_limit_wait = True
-                            m_rem = re.search(r"⏱\s*(\d+h\s*\d+m)", line)
-                            if m_rem:
-                                limit_timer_str = m_rem.group(1)
-                            break
-                        if "[READ]" in line or "[REFLECT]" in line:
-                            log_limit_wait = False
-                            m_l = re.search(r"Lesson #[^\s']+", line)
-                            if m_l and (not self.current_lesson or self.current_lesson == "None"):
-                                self.current_lesson = m_l.group(0)
-                            m_t = re.search(r"⏱\s*(\d+min(?:\s*remaining)?|\d+:\d+|\d+h\s*\d+m)", line)
-                            if m_t:
-                                parsed_time = m_t.group(1).replace("min remaining", "m").replace("min", "m").strip()
-                                if "[READ]" in line and read_timer_str == "N/A":
-                                    read_timer_str = parsed_time
-                                elif "[REFLECT]" in line and submit_timer_str == "N/A":
-                                    submit_timer_str = parsed_time
-                            break
+                log_mtime = os.path.getmtime(LOG_FILE)
+                if log_mtime != self._log_mtime:
+                    self._log_mtime = log_mtime
+                    self._log_state = self._scan_log_state()
+                log_state = getattr(self, "_log_state", {})
+                if log_state.get("progress"):
+                    d_val, t_val = log_state["progress"]
+                    self.progress["done"] = d_val
+                    self.progress["total"] = t_val
+                    self.progress["remaining"] = max(0.0, t_val - d_val)
+                log_limit_wait = log_state.get("log_limit_wait", False)
+                is_retrying_after_midnight = log_state.get("retrying_after_midnight", False)
+                limit_timer_str = log_state.get("limit_timer", "N/A")
+                if (
+                    (not self.current_lesson or self.current_lesson == "None")
+                    and log_state.get("lesson")
+                ):
+                    self.current_lesson = log_state["lesson"]
+                if read_timer_str == "N/A":
+                    read_timer_str = log_state.get("read_timer", "N/A")
+                if submit_timer_str == "N/A":
+                    submit_timer_str = log_state.get("reflect_timer", "N/A")
             except Exception:
                 pass
 

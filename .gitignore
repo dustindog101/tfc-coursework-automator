@@ -4,6 +4,9 @@
 
 # Runtime logs & state
 automation.log
+bot.pid
+telegram_config.json
+telegram_settings.json
 events.jsonl
 *.jsonl
 

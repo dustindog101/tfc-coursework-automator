@@ -4,7 +4,7 @@ description: >-
   Operate, monitor, restart, and debug the TFC coursework automator
   (run_courses.py / run.sh). Use when the user mentions TFC, Foundation of
   Change, community service coursework bot, reading/reflect timers, daily
-  hour limit, automation.log, events.jsonl, or asks to start/stop/check
+  hour limit, automation.log, events.jsonl, Telegram notifications, or asks to start/stop/check
   the bot. Also use when resuming mid-lesson or explaining Done/Continue/Start states.
 ---
 
@@ -138,6 +138,19 @@ TFC_MIN_HOURS_LEFT=0.35
 
 Restart the bot.
 
+## Telegram (optional)
+
+```env
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_ENABLED=1
+```
+
+1. Start bot → message `/start` to link chat
+2. `/status` — live article & phase | `/stats` — hours & ETA
+3. Toggle push: menubar → Settings → Telegram Notifications
+
+Full guide: [docs/TELEGRAM.md](../../docs/TELEGRAM.md). Failures never stop the bot.
+
 ## Files that matter
 
 | Path | Role |
@@ -149,6 +162,8 @@ Restart the bot.
 | `.env.example` | Template only |
 | `automation.log` | Human log (gitignored) |
 | `events.jsonl` | Machine events (gitignored) |
+| `telegram_notify.py` | Optional Telegram push + commands |
+| `docs/TELEGRAM.md` | Telegram setup guide |
 | `AGENT_DOCS.md` | Short developer flow notes |
 | `README.md` | Human quick start |
 

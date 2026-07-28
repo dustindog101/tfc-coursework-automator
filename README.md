@@ -101,6 +101,52 @@ Prefer a clean menu bar interface? Launch `./run_menubar.sh` for a lightweight m
 | **🔄 Anti-Logout Keep-Alive** | Executes subtle micro-scrolls every 2.75 minutes to keep Supabase SPA authentication tokens fresh indefinitely. |
 | **☕ Smart Caffeinate Power Control** | Keeps macOS awake during active coursework, then releases sleep lock on daily limit wait so your Mac can sleep until midnight. Toggleable in Menu Bar Settings. |
 | **📊 JSONL Auditing** | Produces clean human-readable logs (`automation.log`) and machine-auditable JSON events (`events.jsonl`). |
+| **📱 Telegram Notifications** | Optional push alerts + live `/status` and `/stats` commands. Non-blocking — bot keeps running if Telegram fails. Toggle in menubar Settings. |
+
+---
+
+## 📱 Telegram Notifications (Optional)
+
+Get coursework updates on your phone without staring at the terminal.
+
+### What you receive (push)
+
+| Event | Notification |
+| :--- | :--- |
+| Bot started / stopped | Engine online or session summary |
+| New article | Title when a lesson begins |
+| Lesson complete | Hours gained, today’s total, overall progress |
+| Daily limit | 8h cap reached — bot waits for midnight |
+| Errors | Lesson failure with retry note |
+
+### Commands (live on demand)
+
+Message your bot anytime:
+
+| Command | Description |
+| :--- | :--- |
+| `/start` | Link this chat (auto-saves your chat ID) |
+| `/status` | Current article, phase, timer, progress |
+| `/stats` | Total hours, bar chart, today’s work, ETA, completions |
+| `/help` | Command list |
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Add to `.env`:
+
+```env
+TELEGRAM_BOT_TOKEN=your-token-here
+TELEGRAM_ENABLED=1
+```
+
+3. Start the automator: `./run_menubar.sh` or `./run_cli.sh`
+4. Open Telegram → your bot → send **`/start`**
+5. Toggle push on/off: **Menubar → Settings → Telegram Notifications**
+
+> **Security:** Never commit your token. `telegram_config.json` (chat ID) is gitignored. Revoke and regenerate the token in BotFather if it is ever exposed.
+
+See [docs/TELEGRAM.md](docs/TELEGRAM.md) for full details.
 
 ---
 
@@ -166,13 +212,19 @@ TFC_DAILY_HOUR_LIMIT=8.0
 ```bash
 ./run_menubar.sh
 ```
+Streams live bot output in the terminal and starts the menu bar app.
 
-**Option B: Launch Terminal Runner (Headed / Visible Browser)**
+**Option B: Foreground CLI (full terminal output)**
+```bash
+./run_cli.sh
+```
+
+**Option C: Launch Terminal Runner (Headed / Visible Browser)**
 ```bash
 ./run.sh
 ```
 
-**Option C: Launch Terminal Runner (Headless / Background Browser)**
+**Option D: Launch Terminal Runner (Headless / Background Browser)**
 ```bash
 HEADED=0 ./run.sh
 ```
@@ -188,6 +240,9 @@ HEADED=0 ./run.sh
 | `TFC_DAILY_HOUR_LIMIT` | `8.0` | Daily hour limit enforced by platform |
 | `TFC_MIN_HOURS_LEFT` | `0.35` | Minimum remaining hours required to start a lesson |
 | `HEADED` | `1` | `1` = visible browser window, `0` = background headless |
+| `TELEGRAM_BOT_TOKEN` | — | BotFather token for optional Telegram notifications |
+| `TELEGRAM_ENABLED` | `0` | `1` = enable Telegram push (also toggle in menubar) |
+| `ENABLE_CAFFEINATE` | `1` | Keep Mac awake during active coursework |
 
 ---
 
@@ -210,7 +265,7 @@ jq 'select(.event=="progress_snapshot")' events.jsonl | tail -n 1
 
 ## 🛡️ Privacy & Security Guarantee
 
-- **Zero PII in Repository**: Credentials, auth session tokens (`.auth_state.json`), text logs (`automation.log`), and event data (`events.jsonl`) are strictly listed in `.gitignore`.
+- **Zero PII in Repository**: Credentials, auth session tokens (`.auth_state.json`), text logs (`automation.log`), event data (`events.jsonl`), and Telegram chat linkage (`telegram_config.json`) are strictly listed in `.gitignore`.
 - **Environment Isolation**: Sensitive credentials are read solely from your local `.env` file and never committed to source control.
 
 ---
