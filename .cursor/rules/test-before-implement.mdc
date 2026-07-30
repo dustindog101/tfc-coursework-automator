@@ -1,0 +1,45 @@
+---
+description: Test integrations before implementing; safe disk cleanup when storage is low
+alwaysApply: true
+---
+
+# Test Before Implement, Safe Disk Cleanup
+
+## Test first
+
+Before wiring external tools (opencode, agy, Playwright, Telegram, etc.) into the bot:
+
+1. Run the real CLI/API command in the terminal and confirm it works.
+2. Only then change `run_courses.py` or related code.
+3. Run the relevant unit tests after changes (`python3 -m unittest test_*.py`).
+
+Do not ship integration changes based on assumptions or prior session state.
+
+## When disk is low
+
+Check with `df -h /` before large edits or installs. If available space is under ~500 MB:
+
+1. **Tell the user** you are freeing space and list exactly what will be removed.
+2. **Only remove regenerable caches** — never personal files, Downloads, Messages, or project data.
+3. **Never remove** `~/Library/Caches/ms-playwright` (bot needs Chromium).
+4. Remove the minimum needed to continue; prefer the largest safe targets first.
+
+### Safe to remove (regenerates automatically)
+
+| Target | What it is |
+|--------|------------|
+| `~/Library/Caches/CCTClearcutLogger` | Chrome/Google telemetry logs |
+| `~/.cache/opencode` | OpenCode CLI cache |
+| `~/.npm` | npm package cache |
+| `~/Library/Developer/CoreSimulator/Devices` | iOS Simulator device data (recreated on next run) |
+| `/var/folders/.../T/cursor-sandbox-cache` | Cursor sandbox temp |
+| `/var/folders/.../T/node-compile-cache` | Node compile cache |
+| `brew cleanup -s` | Old Homebrew downloads (ask if >100 MB) |
+
+### Never remove without explicit user approval
+
+- `ms-playwright`, browser profiles, `.env`, `events.jsonl`, `automation.log`
+- `~/Downloads`, `~/Desktop`, `~/Pictures`, `~/Library/Messages`
+- Anything under `community-service/` except `__pycache__`
+
+After cleanup, report: what was removed, approximate size freed, and new `df -h /` result.

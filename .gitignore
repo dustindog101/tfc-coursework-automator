@@ -4,10 +4,13 @@
 
 # Runtime logs & state
 automation.log
+idrive_automation.log
+idrive_bot.pid
+idrive_status.json
 bot.pid
 telegram_config.json
 telegram_settings.json
-telegram_lesson_msg.json
+reflection_drafts.json
 events.jsonl
 *.jsonl
 
@@ -21,6 +24,7 @@ venv/
 .playwright/
 
 # Local dev / exploration artifacts (may contain session data)
+explore_idrive_output/
 explore_site*.py
 smoke_test.py
 test_flash.txt
@@ -31,6 +35,7 @@ _coursework_*
 
 # Local scratch & temp files
 scratch/
+idrive-safely-automator/
 
 # OS
 .DS_Store

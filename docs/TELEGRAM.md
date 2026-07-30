@@ -26,8 +26,8 @@ The bot sends **one message per lesson** and **edits it in place** as work progr
 | Step | Message update |
 | :--- | :--- |
 | Lesson starts | New "Current Lesson" card |
-| Reading | Phase 📖 Reading + today's bar (`6.1 / 8 h · 1.9 h left`) |
-| Reflection drafted | Appends the AI reflection text |
+| Reading | Phase 📖 Reading + today's bar + timer (refreshes ~60s) |
+| Reflection drafted | **generated** or **loaded from disk** + preview |
 | Reflect phase | Phase ✍️ Reflection + timer |
 | Submitted | "Reflection submitted to site ✓" |
 | Lesson complete | Final summary, then clears for next article |

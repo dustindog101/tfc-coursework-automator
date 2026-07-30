@@ -26,6 +26,9 @@ EVENTS_FILE = os.getenv("TFC_EVENTS_FILE", os.path.join(ROOT_DIR, "events.jsonl"
 BOT_PID_FILE = os.path.join(ROOT_DIR, "bot.pid")
 BOT_COMPLETED_FILE = os.path.join(ROOT_DIR, "bot_completed_courses.json")
 DAILY_HOUR_LIMIT = float(os.getenv("TFC_DAILY_HOUR_LIMIT", "8.0"))
+COURSE_HOUR_TOTAL = 75.0
+TYPICAL_LESSON_HOURS = 1.1
+MAX_LESSON_HOURS = 2.0
 
 _log = logging.getLogger("tfc.telegram")
 _started = False
@@ -40,6 +43,8 @@ _SKIP_PUSH_EVENTS = frozenset({
 
 _CMD_FOOTER = "<i>Commands: /status · /stats · /help</i>"
 _REFLECTION_PREVIEW_MAX = 600
+_LESSON_EDIT_INTERVAL_S = int(os.getenv("TELEGRAM_LESSON_EDIT_INTERVAL_S", "60"))
+_last_lesson_card_edit = 0.0
 
 # Queue ops: ("send", chat_id, text) | ("edit", chat_id, message_id, text)
 
@@ -299,6 +304,32 @@ def _worker() -> None:
             _log_throttled(f"Telegram worker error: {exc}")
 
 
+def _map_timer_phase(phase: str) -> str:
+    p = (phase or "").upper()
+    if p == "READ":
+        return "reading"
+    if p == "REFLECT":
+        return "reflect"
+    return (phase or "reading").lower()
+
+
+def _maybe_refresh_lesson_card(record: dict, *, phase: Optional[str] = None) -> None:
+    """Edit the pinned lesson message from timer_sync (throttled)."""
+    global _last_lesson_card_edit
+    if not is_enabled() or get_chat_id() is None:
+        return
+    if not _load_lesson_msg().get("message_id"):
+        return
+    now = time.time()
+    if now - _last_lesson_card_edit < _LESSON_EDIT_INTERVAL_S:
+        return
+    card_phase = phase or _map_timer_phase(str(record.get("phase", "")))
+    if card_phase not in ("reading", "reflect"):
+        return
+    _last_lesson_card_edit = now
+    _enqueue_lesson_update(_build_lesson_card_from_record(record, phase=card_phase))
+
+
 def _extract_title_from_card(text: str) -> str:
     for line in text.splitlines():
         if "<b>Article</b>" in line or "<b>Lesson</b>" in line:
@@ -407,6 +438,45 @@ def _infer_lesson_phase(record: dict) -> str:
     return "reading"
 
 
+def _reconcile_overall_hours(events: list[dict], snapshot_done: float) -> float:
+    """Correct inflated overall hours after a bad post-lesson scrape (e.g. +3.0h)."""
+    completes = [
+        e for e in events
+        if e.get("event") == "lesson_complete" and e.get("hours_done") is not None
+    ]
+    if not completes:
+        return snapshot_done
+
+    last = completes[-1]
+    gain = float(last.get("hours_gained", 0))
+    if gain <= MAX_LESSON_HOURS:
+        return snapshot_done
+
+    title = last.get("lesson_title")
+    anchor_done: Optional[float] = None
+    for ev in reversed(events):
+        if ev.get("event") not in ("reading_start", "reflect_start"):
+            continue
+        if ev.get("lesson_title") != title:
+            continue
+        if ev.get("hours_done") is not None:
+            anchor_done = float(ev["hours_done"])
+            break
+
+    if anchor_done is not None:
+        corrected = anchor_done + TYPICAL_LESSON_HOURS
+        if abs(snapshot_done - float(last["hours_done"])) < 0.05:
+            return corrected
+
+    if len(completes) >= 2:
+        prev_done = float(completes[-2]["hours_done"])
+        corrected = prev_done + TYPICAL_LESSON_HOURS
+        if snapshot_done > corrected + 0.5:
+            return corrected
+
+    return snapshot_done
+
+
 def _parse_live_state(events: list[dict]) -> dict[str, Any]:
     """Phase + hours from the same newest anchor — never mix stale timer_sync with limit wait."""
     state: dict[str, Any] = {
@@ -420,6 +490,7 @@ def _parse_live_state(events: list[dict]) -> dict[str, Any]:
         "hours_total": 75.0,
         "reflection": None,
         "reflection_source": None,
+        "reflection_draft_origin": None,
         "limit_reset_secs": None,
         "at_daily_limit": False,
     }
@@ -465,7 +536,7 @@ def _parse_live_state(events: list[dict]) -> dict[str, Any]:
     for ev in reversed(events):
         if ev.get("event") == "progress_snapshot":
             state["hours_done"] = float(ev.get("done", state["hours_done"]))
-            state["hours_total"] = float(ev.get("total", 75))
+            state["hours_total"] = float(ev.get("total", COURSE_HOUR_TOTAL))
             break
 
     phase = state["phase"]
@@ -484,6 +555,7 @@ def _parse_live_state(events: list[dict]) -> dict[str, Any]:
         state["article_title"] = None
         state["reflection"] = None
         state["reflection_source"] = None
+        state["reflection_draft_origin"] = None
     elif phase in ("reading", "reflect", "starting", "submitted"):
         for ev in reversed(events):
             if ev.get("event") != "timer_sync":
@@ -511,12 +583,17 @@ def _parse_live_state(events: list[dict]) -> dict[str, Any]:
             if ev.get("event") == "reflection_generated":
                 state["reflection"] = ev.get("reflection")
                 state["reflection_source"] = ev.get("source")
+                state["reflection_draft_origin"] = ev.get("draft_origin")
                 if not state["article_title"]:
                     state["article_title"] = ev.get("article_title")
                 break
     elif anchor and anchor.get("hours_today") is not None:
         state["hours_today"] = float(anchor["hours_today"])
         state["hours_remaining_today"] = max(0.0, DAILY_HOUR_LIMIT - state["hours_today"])
+
+    if state["hours_done"] > 0:
+        state["hours_done"] = _reconcile_overall_hours(events, state["hours_done"])
+        state["hours_total"] = float(state.get("hours_total") or COURSE_HOUR_TOTAL)
 
     return state
 
@@ -532,6 +609,7 @@ def _build_lesson_card(
     timer_secs: Optional[int] = None,
     reflection: Optional[str] = None,
     reflection_source: Optional[str] = None,
+    draft_origin: Optional[str] = None,
     submitted: bool = False,
 ) -> str:
     title = "✅ Lesson Submitted" if submitted or phase == "submitted" else "📚 Current Lesson"
@@ -546,14 +624,23 @@ def _build_lesson_card(
         lines.append(_daily_line(hours_today, at_limit=at_limit))
     if timer_secs and phase in ("reading", "reflect"):
         lines.append(f"<b>Timer</b>  {_esc(_format_timer_secs(timer_secs))}")
-    if hours_done and hours_total:
+    if hours_done or hours_total:
         pct = int((hours_done / hours_total) * 100) if hours_total > 0 else 0
-        lines.append(f"<b>Overall</b>  {hours_done:.1f} / {hours_total:.0f} h ({pct}%)")
+        bar = _progress_bar(hours_done, hours_total)
+        lines.append(f"<b>Overall</b>  {hours_done:.1f} / {hours_total:.0f} h")
+        lines.append(f"<code>{bar}</code>  {pct}%")
     if reflection:
         preview = _truncate_reflection(reflection)
         src = f" ({reflection_source})" if reflection_source else ""
+        origin = draft_origin or ""
+        if origin == "loaded":
+            label = f"<b>Reflection draft</b>  <i>loaded from disk</i>{_esc(src)}"
+        elif origin == "generated":
+            label = f"<b>Reflection draft</b>  <i>generated</i>{_esc(src)}"
+        else:
+            label = f"<b>Reflection draft</b>{_esc(src)}"
         lines.append("")
-        lines.append(f"<b>Reflection draft</b>{_esc(src)}")
+        lines.append(label)
         lines.append(f"<i>{_esc(preview)}</i>")
     if submitted or phase == "submitted":
         lines.append("")
@@ -573,9 +660,10 @@ def _build_lesson_card_from_record(record: dict, phase: Optional[str] = None) ->
         hours_today=float(record.get("hours_today", live.get("hours_today", 0))),
         hours_done=float(record.get("hours_done", live.get("hours_done", 0))),
         hours_total=float(live.get("hours_total", 75)),
-        timer_secs=live.get("timer_secs"),
+        timer_secs=record.get("timer_secs") if record.get("timer_secs") is not None else live.get("timer_secs"),
         reflection=reflection,
         reflection_source=record.get("source") or live.get("reflection_source"),
+        draft_origin=record.get("draft_origin") or live.get("reflection_draft_origin"),
         submitted=(p == "submitted"),
     )
 
@@ -661,6 +749,10 @@ def on_event(record: dict) -> None:
     if event == "reflect_submitted":
         card = _build_lesson_card_from_record(record, phase="submitted")
         _enqueue_lesson_update(card)
+        return
+
+    if event == "timer_sync":
+        _maybe_refresh_lesson_card(record)
         return
 
     if event == "daily_limit_hit":
@@ -836,8 +928,9 @@ def build_stats_text() -> str:
         hours_today = max(hours_today, float(live["hours_today"]))
 
     done = float(progress.get("done", progress.get("hours_done", live.get("hours_done", 0))))
-    total = float(progress.get("total", 75))
-    remaining = float(progress.get("remaining", max(0.0, total - done)))
+    done = _reconcile_overall_hours(events, done)
+    total = float(progress.get("total", COURSE_HOUR_TOTAL))
+    remaining = max(0.0, total - done)
     pct = int((done / total) * 100) if total > 0 else 0
     bar = _progress_bar(done, total)
     eta_days = _estimate_days(remaining, hours_today)

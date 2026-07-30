@@ -29,6 +29,67 @@ class TestEventMapping(unittest.TestCase):
         self.assertIsNone(tg.event_to_message({"event": "timer_sync"}))
 
 
+class TestLiveLessonCard(unittest.TestCase):
+    def setUp(self):
+        tg._last_lesson_card_edit = 0.0
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_lesson = tg.LESSON_MSG_FILE
+        self._orig_settings = tg.SETTINGS_FILE
+        self._orig_config = tg.CONFIG_FILE
+        tg.LESSON_MSG_FILE = os.path.join(self._tmpdir.name, "lesson.json")
+        tg.SETTINGS_FILE = os.path.join(self._tmpdir.name, "settings.json")
+        tg.CONFIG_FILE = os.path.join(self._tmpdir.name, "config.json")
+        tg._save_json(tg.SETTINGS_FILE, {"enabled": True})
+        tg._save_json(tg.CONFIG_FILE, {"chat_id": 12345})
+        tg._save_lesson_msg(42, "Test Lesson")
+
+    def tearDown(self):
+        tg.LESSON_MSG_FILE = self._orig_lesson
+        tg.SETTINGS_FILE = self._orig_settings
+        tg.CONFIG_FILE = self._orig_config
+        tg._last_lesson_card_edit = 0.0
+        self._tmpdir.cleanup()
+
+    @patch.object(tg, "_enqueue_lesson_update")
+    def test_timer_sync_refreshes_lesson_card(self, mock_enqueue):
+        tg.on_event({
+            "event": "timer_sync",
+            "phase": "READ",
+            "timer_secs": 1800,
+            "lesson_title": "Test Lesson",
+            "hours_done": 40.0,
+            "hours_today": 2.0,
+        })
+        mock_enqueue.assert_called_once()
+        card = mock_enqueue.call_args[0][0]
+        self.assertIn("30:00", card)
+        self.assertIn("█", card)
+
+    @patch.object(tg, "_enqueue_lesson_update")
+    def test_timer_sync_throttled(self, mock_enqueue):
+        tg._last_lesson_card_edit = __import__("time").time()
+        tg.on_event({"event": "timer_sync", "phase": "READ", "timer_secs": 900})
+        mock_enqueue.assert_not_called()
+
+    @patch.object(tg, "_enqueue_lesson_update")
+    def test_timer_sync_skipped_without_lesson_message(self, mock_enqueue):
+        tg._clear_lesson_msg()
+        tg.on_event({"event": "timer_sync", "phase": "READ", "timer_secs": 900})
+        mock_enqueue.assert_not_called()
+
+    def test_lesson_card_has_progress_bar(self):
+        card = tg._build_lesson_card(
+            lesson_title="L1",
+            phase="reading",
+            hours_today=2.0,
+            hours_done=40.0,
+            hours_total=75.0,
+            timer_secs=1200,
+        )
+        self.assertIn("████", card)
+        self.assertIn("20:00", card)
+
+
 class TestLiveState(unittest.TestCase):
     def test_reading_beats_stale_limit_wait(self):
         events = [
@@ -60,7 +121,7 @@ class TestLiveState(unittest.TestCase):
         self.assertEqual(state["phase"], "limit_wait")
         self.assertIsNone(state["lesson_title"])
         self.assertIsNone(state["reflection"])
-        with patch.object(tg, "is_bot_running", return_value=True):
+        with patch.object(tg, "is_bot_running", return_value=True), patch.object(tg, "_tail_events", return_value=events):
             text = tg.build_status_text()
         self.assertNotIn("Old", text)
         self.assertIn("limit reached", text.lower())
@@ -82,7 +143,8 @@ class TestLiveState(unittest.TestCase):
         state = tg._parse_live_state(events)
         self.assertEqual(state["phase"], "limit_wait")
         self.assertEqual(state["hours_today"], 8.0)
-        text = tg.build_status_text()
+        with patch.object(tg, "_tail_events", return_value=events):
+            text = tg.build_status_text()
         self.assertIn("limit reached", text.lower())
         self.assertNotIn("6.1", text)
 
@@ -97,6 +159,26 @@ class TestLiveState(unittest.TestCase):
         self.assertIn("Reflection draft", card)
         self.assertIn("draft reflection", card)
         self.assertIn("3.5", card)
+
+    def test_lesson_card_shows_loaded_origin(self):
+        card = tg._build_lesson_card(
+            lesson_title="L1",
+            phase="reading",
+            reflection="draft text here" + "x" * 80,
+            reflection_source="opencode",
+            draft_origin="loaded",
+        )
+        self.assertIn("loaded from disk", card)
+
+    def test_lesson_card_shows_generated_origin(self):
+        card = tg._build_lesson_card(
+            lesson_title="L1",
+            phase="reflect",
+            reflection="draft text here" + "x" * 80,
+            reflection_source="agy",
+            draft_origin="generated",
+        )
+        self.assertIn("generated", card)
 
 
 class TestEnabledGating(unittest.TestCase):
@@ -206,6 +288,35 @@ class TestCommands(unittest.TestCase):
         tg.register_chat(111)
         tg._handle_command(222, "/status")
         mock_send.assert_not_called()
+
+
+class TestHoursReconcile(unittest.TestCase):
+    def test_corrects_inflated_plus_three_lesson(self):
+        events = [
+            {
+                "event": "lesson_complete",
+                "lesson_title": "Behavioral Activation: Overcoming Avoidance",
+                "hours_gained": 1.0,
+                "hours_done": 41.9,
+            },
+            {"event": "reading_start", "lesson_title": "Cognitive Restructuring Techniques", "hours_done": 40.9},
+            {
+                "event": "lesson_complete",
+                "lesson_title": "Cognitive Restructuring Techniques",
+                "hours_gained": 3.0,
+                "hours_done": 43.9,
+            },
+            {"event": "progress_snapshot", "done": 43.9, "total": 75, "remaining": 31.1},
+        ]
+        state = tg._parse_live_state(events)
+        self.assertAlmostEqual(state["hours_done"], 42.0)
+
+    def test_leaves_normal_lesson_untouched(self):
+        events = [
+            {"event": "lesson_complete", "hours_gained": 1.1, "hours_done": 37.4},
+            {"event": "progress_snapshot", "done": 37.4, "total": 75},
+        ]
+        self.assertAlmostEqual(tg._reconcile_overall_hours(events, 37.4), 37.4)
 
 
 if __name__ == "__main__":

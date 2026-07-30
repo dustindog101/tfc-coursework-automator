@@ -57,13 +57,13 @@ Login → scrape /coursework catalog
      → pick next incomplete lesson (CTA → Continue → Start)
      → inspect mid-work state (read vs reflect vs done)
      → wait reading timer (scroll keepalive)
-     → AI reflection via agy (fallback text if agy missing)
-     → wait reflect timer → submit
+     → AI reflection via opencode → agy (saved to reflection_drafts.json)
+     → wait reflect timer → submit → clear draft
      → re-scrape catalog → repeat
      → stop at daily limit or empty queue
 ```
 
-**Mid-work resume is built in.** If the bot restarts while a timer is running, the next `inspect_lesson` call re-detects the real page state and continues from read or reflect. You do **not** need to remember which article was open.
+**Mid-work resume is built in.** If the bot restarts while a timer is running, the next `inspect_lesson` call re-detects the real page state and continues from read or reflect. Saved reflections in `reflection_drafts.json` are restored automatically (CLI: `Loaded saved reflection from disk`).
 
 Full decision tree: [state-cases.md](state-cases.md)
 
@@ -79,7 +79,9 @@ TFC done:26+2 · #29/620 READ 12:40 · Harm Reduction Strategies · today 1.4/8h
 |-------|---------|
 | `done:26+2` | Catalog Done count + lessons finished this session |
 | `#29/620` | Rough position / remaining queue size |
-| `READ` / `REFLECT` / `SUBMIT_WAIT` | Current phase |
+| `🌙` / Limit Wait | Daily 8h cap — engine resting until midnight (process still running) |
+| `🟢` / Active | Reading, reflecting, or between lessons |
+| `⏸️` / Paused | Bot process stopped |
 | `12:40` | Timer remaining (mm:ss) |
 | `today 1.4/8h` | Hours used today vs daily cap |
 | `left 6.6h` | Hours remaining today |
@@ -162,6 +164,7 @@ Full guide: [docs/TELEGRAM.md](../../docs/TELEGRAM.md). Failures never stop the 
 | `.env.example` | Template only |
 | `automation.log` | Human log (gitignored) |
 | `events.jsonl` | Machine events (gitignored) |
+| `reflection_drafts.json` | Saved reflections until submit (gitignored) |
 | `telegram_notify.py` | Optional Telegram push + commands |
 | `docs/TELEGRAM.md` | Telegram setup guide |
 | `AGENT_DOCS.md` | Short developer flow notes |

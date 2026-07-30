@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -69,9 +70,61 @@ def subprocess_env(extra: Optional[dict] = None) -> dict:
     env = os.environ.copy()
     for key in _MALLOC_ENV_KEYS:
         env.pop(key, None)
+    env["PLAYWRIGHT_BROWSERS_PATH"] = ensure_playwright_browsers_path()
     if extra:
         env.update(extra)
     return env
+
+
+def ensure_playwright_browsers_path() -> str:
+    """Use a stable user cache — ignore broken Cursor sandbox browser paths."""
+    default = os.path.expanduser("~/Library/Caches/ms-playwright")
+    cur = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    cur_norm = cur.replace("\\", "/")
+    if not cur or "cursor-sandbox-cache" in cur_norm or not os.path.isdir(cur):
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = default
+        return default
+    return cur
+
+
+def _chromium_executable_exists(playwright) -> bool:
+    try:
+        exe = playwright.chromium.executable_path
+        return bool(exe and os.path.exists(exe))
+    except Exception:
+        return False
+
+
+async def launch_browser(playwright, *, timeout_s: float = 90.0):
+    """Launch Chromium with install fallback and a hard timeout."""
+    ensure_playwright_browsers_path()
+    if not _chromium_executable_exists(playwright):
+        log.warning("Chromium missing — installing via: python3 -m playwright install chromium")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                cwd=ROOT_DIR,
+                env=subprocess_env(),
+                timeout=300,
+                check=False,
+            )
+        except Exception as e:
+            log.error(f"playwright install failed: {e}")
+
+    if not _chromium_executable_exists(playwright):
+        raise RuntimeError(
+            "Chromium not installed. Run: PLAYWRIGHT_BROWSERS_PATH=~/Library/Caches/ms-playwright "
+            "python3 -m playwright install chromium"
+        )
+
+    log.info("🌐 Launching browser...")
+    return await asyncio.wait_for(
+        playwright.chromium.launch(
+            headless=not bool(os.getenv("HEADED")),
+            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--blink-settings=imagesEnabled=true"],
+        ),
+        timeout=timeout_s,
+    )
 
 EMAIL = os.getenv("TFC_EMAIL", "")
 PASSWORD = os.getenv("TFC_PASSWORD", "")
@@ -79,6 +132,9 @@ BASE_URL = os.getenv("TFC_BASE_URL", "https://www.thefoundationofchange.org")
 LOG_FILE = os.getenv("TFC_LOG_FILE", os.path.join(ROOT_DIR, "automation.log"))
 EVENTS_FILE = os.getenv("TFC_EVENTS_FILE", os.path.join(ROOT_DIR, "events.jsonl"))
 COMPLETED_COURSES_FILE = os.getenv("TFC_COMPLETED_COURSES_FILE", os.path.join(ROOT_DIR, "completed_courses.json"))
+REFLECTION_DRAFTS_FILE = os.getenv(
+    "TFC_REFLECTION_DRAFTS_FILE", os.path.join(ROOT_DIR, "reflection_drafts.json")
+)
 
 SCROLL_INTERVAL_S = 165   # ~2.75 min (bundled with timer resync)
 TIMER_RESYNC_S    = 165   # DOM timer read + scroll keepalive interval
@@ -112,7 +168,7 @@ class TerminalLogHandler(logging.Handler):
 class _StatusOnlyFilter(logging.Filter):
     """Drop noisy INFO during normal operation from the terminal handler."""
     _NOISY_PREFIXES = (
-        "agy reflection", "opencode reflection", "↕ scroll", "⏱ ",
+        "↕ scroll", "⏱ ",
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -202,16 +258,17 @@ def get_today_hours_from_log() -> float:
 
 
 def parse_daily_remaining(body: str) -> Optional[float]:
-    """Parse '3.9h remaining today (8h max)' or '0.0h daily limit reached' from coursework/dashboard."""
+    """Parse hours left today from coursework/dashboard — not overall course remaining."""
     if re.search(r"daily limit reached", body, re.IGNORECASE):
         return 0.0
 
     for pat in [
         r"TODAY'S LIMIT\s*\n\s*([\d.]+)\s*h",
         r"([\d.]+)\s*h\s*\n\s*remaining today",
+        r"([\d.]+)\s*h\s+remaining today\b",
         r"remaining today[^\d]*([\d.]+)\s*h",
         r"([\d.]+)\s*h\s*\n\s*daily limit reached",
-        r"([\d.]+)\s*h\s*\n\s*remaining",
+        r"today['']?s limit[^\d]*([\d.]+)\s*h",
     ]:
         m = re.search(pat, body, re.IGNORECASE)
         if m:
@@ -297,6 +354,36 @@ class RunState:
 
 
 RUN_STATE = RunState()
+
+LLM_ABORT = threading.Event()
+_pending_llm_futures: list = []
+
+
+def should_stop_work(rs: Optional[RunState] = None) -> bool:
+    """True when daily limit wait is active — no lessons, timers, or LLM work."""
+    state = rs or RUN_STATE
+    return state.phase == "LIMIT_WAIT" or LLM_ABORT.is_set()
+
+
+async def drain_llm_tasks() -> None:
+    """Cancel pending background LLM executor jobs (e.g. orphaned reading drafts)."""
+    global _pending_llm_futures
+    for fut in list(_pending_llm_futures):
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+    _pending_llm_futures.clear()
+
+
+async def enter_limit_wait(page, rs: RunState) -> None:
+    """Halt all coursework work and rest until the site daily limit resets."""
+    LLM_ABORT.set()
+    await drain_llm_tasks()
+    rs.phase = "LIMIT_WAIT"
+    rs.title = "Daily limit — waiting for midnight reset"
+    await wait_for_daily_reset(page, rs)
+    LLM_ABORT.clear()
 
 
 def estimate_days_to_complete(
@@ -414,16 +501,89 @@ _FALLBACKS = [
 ]
 
 _AGY_LIMIT_MARKERS = (
-    "quota", "rate limit", "rate-limit", "429", "exhausted",
-    "too many requests", "resource exhausted", "limit reached",
+    "quota exceeded",
+    "quota limit",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "resource exhausted",
+    "exhausted quota",
+    "429",
 )
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+_OPENCODE_ERROR_MARKERS = (
+    "error:",
+    "unknownerror",
+    "failed to execute statement",
+    "session not found",
+    "unexpected server error",
+)
+
+AGY_QUOTA_COOLDOWN_S = int(os.getenv("AGY_QUOTA_COOLDOWN_S", str(2 * 3600)))
+_AGY_QUOTA_UNTIL = 0.0
+_LLM_LOCK = threading.Lock()
 
 def _strip_em_dash(t: str) -> str:
     return t.replace("\u2014", ",").replace("\u2013", ",").replace("—", ",").replace("–", ",")
 
 
-OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/mimo-v2.5-free")
-OPENCODE_USER_MSG = "Write only the reflection text, no preamble."
+_DEFAULT_OPENCODE_MODELS = "opencode/deepseek-v4-flash-free,opencode/mimo-v2.5-free"
+OPENCODE_VARIANT = os.getenv("OPENCODE_VARIANT", "minimal")
+OPENCODE_USER_MSG = (
+    "Reply with ONLY the reflection paragraph. "
+    "No title, labels, bullet points, rules, or commentary about how you wrote it."
+)
+
+_LLM_META_MARKERS = (
+    "output rules",
+    "follow exactly",
+    "write only the reflection",
+    "reflection question:",
+    "article title:",
+    "article content:",
+    "you are writing",
+    "no preamble",
+    "meta-commentary",
+    "style check",
+    "hard limit",
+    "characters (hard",
+    "guidelines",
+    "do not include",
+)
+
+
+def build_reflection_system_prompt(
+    article_title: str, article_body: str, prompt_text: str,
+) -> str:
+    """System/context prompt for opencode and agy — reflection text only in the reply."""
+    body = (article_body or "")[:2500]
+    return (
+        "Write one short coursework reflection for a community service program.\n\n"
+        "REPLY FORMAT (critical):\n"
+        "- Output ONLY the reflection paragraph itself.\n"
+        "- Do NOT repeat these instructions, the question, or article title.\n"
+        "- Do NOT use labels like 'Reflection:', bullet lists, or style notes.\n"
+        "- Do NOT explain your writing process.\n"
+        "- Length: 80–295 characters (never exceed 295).\n"
+        "- Voice: casual 19-year-old college student, first person, informal.\n"
+        "- Light natural typos are ok (dont, im, cant). Lowercase sentence starts are fine.\n"
+        "- No em dashes (— or –). No AI buzzwords (delve, tapestry, furthermore, crucial).\n"
+        "- Answer the reflection question using ideas from the article.\n\n"
+        f"Article title: {article_title}\n\n"
+        f"Article content:\n{body}\n\n"
+        f"Reflection question: {prompt_text}\n"
+    )
+
+
+def opencode_models() -> list[str]:
+    """Comma-separated OPENCODE_MODEL — try each in order before agy fallback."""
+    raw = os.getenv("OPENCODE_MODEL", _DEFAULT_OPENCODE_MODELS)
+    models = [m.strip() for m in raw.split(",") if m.strip()]
+    return models or ["opencode/mimo-v2.5-free"]
+
+
+OPENCODE_MODEL = opencode_models()[0]
 
 
 def _clean_llm_text(text: str) -> str:
@@ -433,17 +593,36 @@ def _clean_llm_text(text: str) -> str:
     return text
 
 
+def _line_looks_like_meta(line: str) -> bool:
+    low = line.lower()
+    return any(marker in low for marker in _LLM_META_MARKERS)
+
+
+def _llm_output_is_invalid(text: str) -> bool:
+    """Reject instruction echoes, meta commentary, or too-short replies."""
+    cleaned = (text or "").strip()
+    if len(cleaned) < REFLECTION_MIN:
+        return True
+    low = cleaned.lower()
+    if any(marker in low for marker in _LLM_META_MARKERS):
+        return True
+    if cleaned.count("\n") >= 2 and ("- " in cleaned or "• " in cleaned):
+        return True
+    return False
+
+
 def _extract_prose(text: str) -> str:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    prose = next(
-        (
-            l for l in reversed(lines)
-            if len(l) >= REFLECTION_MIN
-            and not l.startswith("{")
-            and not l.startswith("timestamp")
-        ),
-        text,
-    )
+    candidates = [
+        l for l in reversed(lines)
+        if len(l) >= REFLECTION_MIN
+        and not l.startswith("{")
+        and not l.startswith("timestamp")
+        and not _line_looks_like_meta(l)
+    ]
+    prose = candidates[0] if candidates else text
+    if _llm_output_is_invalid(prose):
+        return ""
     return prose[:REFLECTION_MAX]
 
 
@@ -452,7 +631,37 @@ def _agy_hit_limit(result: subprocess.CompletedProcess) -> bool:
     return any(marker in text for marker in _AGY_LIMIT_MARKERS)
 
 
-def _build_opencode_cmd(system_prompt: str) -> tuple[list[str], Optional[str]]:
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub("", text)
+
+
+def _opencode_has_error(result: subprocess.CompletedProcess) -> bool:
+    """Treat non-zero exit or error text in output as failure."""
+    if result.returncode != 0:
+        return True
+    text = _strip_ansi(f"{result.stdout or ''}\n{result.stderr or ''}").lower()
+    return any(marker in text for marker in _OPENCODE_ERROR_MARKERS)
+
+
+def _agy_in_cooldown() -> bool:
+    return time.time() < _AGY_QUOTA_UNTIL
+
+
+def _mark_agy_quota_hit() -> None:
+    global _AGY_QUOTA_UNTIL
+    _AGY_QUOTA_UNTIL = time.time() + AGY_QUOTA_COOLDOWN_S
+    hours = AGY_QUOTA_COOLDOWN_S / 3600
+    log.warning(
+        f"agy quota/rate limit — skipping agy fallback for {hours:g}h"
+    )
+
+
+def _log_llm_draft(source: str, text: str) -> None:
+    preview = text if len(text) <= 120 else text[:117] + "..."
+    log.info(f"   ✍️  {source} draft ({len(text)} chars): {preview!r}")
+
+
+def _build_opencode_cmd(system_prompt: str, model: str) -> tuple[list[str], Optional[str]]:
     """
     Build opencode argv. Always attach prompt via -f after the user message.
     Prompts often start with '-' (bullet rules) which breaks positional parsing.
@@ -460,86 +669,102 @@ def _build_opencode_cmd(system_prompt: str) -> tuple[list[str], Optional[str]]:
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
     tmp.write(system_prompt)
     tmp.close()
-    return [
-        "opencode", "run", "-m", OPENCODE_MODEL, "--auto",
-        OPENCODE_USER_MSG, "-f", tmp.name,
-    ], tmp.name
+    cmd = [
+        "opencode", "run", "-m", model, "--auto",
+    ]
+    if OPENCODE_VARIANT:
+        cmd.extend(["--variant", OPENCODE_VARIANT])
+    cmd.extend([OPENCODE_USER_MSG, "-f", tmp.name])
+    return cmd, tmp.name
 
 
 def _run_llm_prompt(system_prompt: str) -> Optional[tuple[str, str]]:
     """
-    Try agy → opencode (mimo) → return None.
+    Try opencode → agy → return None.
     Returns (reflection text, source) or None on all failures.
+    Serialized — one LLM job at a time.
     """
-    # ── 1. Try agy ────────────────────────────────────────────────────────────
-    try:
-        result = subprocess.run(
-            ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)"],
-            capture_output=True, text=True, timeout=60, cwd=ROOT_DIR, env=subprocess_env(),
-        )
-        if result.returncode == 0:
-            text = _extract_prose(_clean_llm_text(result.stdout))
-            if len(text) >= REFLECTION_MIN:
-                log.debug(f"agy reflection ({len(text)} chars): {text!r}")
-                return text, "agy"
-            log.warning(f"agy output too short ({len(text)} chars): {text!r}")
-        elif _agy_hit_limit(result):
-            log.warning("agy quota/rate limit hit — trying opencode fallback")
-        else:
-            log.warning(f"agy exit {result.returncode}: {(result.stderr or result.stdout)[:300]}")
-    except subprocess.TimeoutExpired:
-        log.warning("agy timed out (60s) — trying opencode fallback")
-    except FileNotFoundError:
-        log.warning("agy not found in PATH — trying opencode fallback")
-    except Exception as e:
-        log.warning(f"agy error: {e} — trying opencode fallback")
+    if LLM_ABORT.is_set():
+        return None
 
-    # ── 2. Try opencode (mimo) ────────────────────────────────────────────────
-    tmp_path = None
-    try:
-        cmd, tmp_path = _build_opencode_cmd(system_prompt)
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, cwd=ROOT_DIR, env=subprocess_env(),
-        )
-        if result.returncode == 0:
-            prose = _extract_prose(_clean_llm_text(result.stdout))
-            if len(prose) >= REFLECTION_MIN:
-                log.debug(f"opencode reflection ({len(prose)} chars): {prose!r}")
-                return prose, "opencode"
-            log.warning(f"opencode output too short ({len(prose)} chars)")
-        else:
-            log.warning(f"opencode exit {result.returncode}: {result.stderr[:200]}")
-    except subprocess.TimeoutExpired:
-        log.warning("opencode timed out (120s)")
-    except FileNotFoundError:
-        log.warning("opencode not found in PATH")
-    except Exception as e:
-        log.warning(f"opencode error: {e}")
-    finally:
-        if tmp_path:
+    with _LLM_LOCK:
+        if LLM_ABORT.is_set():
+            return None
+
+        for model in opencode_models():
+            tmp_path = None
             try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+                cmd, tmp_path = _build_opencode_cmd(system_prompt, model)
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120, cwd=ROOT_DIR, env=subprocess_env(),
+                )
+                if _opencode_has_error(result):
+                    err = _strip_ansi((result.stderr or result.stdout or ""))[:200]
+                    log.warning(f"opencode/{model} failed: {err}")
+                else:
+                    prose = _extract_prose(_clean_llm_text(result.stdout))
+                    if len(prose) >= REFLECTION_MIN:
+                        _log_llm_draft(f"opencode/{model.split('/')[-1]}", prose)
+                        return prose, "opencode"
+                    if _llm_output_is_invalid(_clean_llm_text(result.stdout)):
+                        log.warning(f"opencode/{model} returned meta/instruction text — skipping")
+                    else:
+                        log.warning(f"opencode/{model} output too short ({len(prose)} chars)")
+            except subprocess.TimeoutExpired:
+                log.warning(f"opencode/{model} timed out (120s)")
+            except FileNotFoundError:
+                log.warning("opencode not found in PATH — trying agy fallback")
+                break
+            except Exception as e:
+                log.warning(f"opencode/{model} error: {e}")
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
 
-    return None
+        log.info("   opencode models exhausted — trying agy fallback")
+
+        if _agy_in_cooldown():
+            log.info("   agy on cooldown — skipping agy fallback")
+            return None
+
+        try:
+            result = subprocess.run(
+                ["agy", "-p", system_prompt, "--model", "Gemini 3.6 Flash (Low)"],
+                capture_output=True, text=True, timeout=60, cwd=ROOT_DIR, env=subprocess_env(),
+            )
+            if result.returncode == 0:
+                text = _extract_prose(_clean_llm_text(result.stdout))
+                if len(text) >= REFLECTION_MIN:
+                    _log_llm_draft("agy", text)
+                    return text, "agy"
+                log.warning(f"agy output too short ({len(text)} chars): {text!r}")
+            elif _agy_hit_limit(result):
+                _mark_agy_quota_hit()
+            else:
+                log.warning(f"agy exit {result.returncode}: {(result.stderr or result.stdout)[:300]}")
+        except subprocess.TimeoutExpired:
+            log.warning("agy timed out (60s)")
+        except FileNotFoundError:
+            log.warning("agy not found in PATH")
+        except Exception as e:
+            log.warning(f"agy error: {e}")
+
+        return None
 
 
 def call_agy(article_title: str, article_body: str, prompt_text: str) -> tuple[str, str]:
     """
-    Generate a reflection via agy → opencode → hardcoded fallback chain.
-    Returns (reflection_text, source) where source is agy|opencode|fallback.
+    Generate a reflection via opencode → agy → hardcoded fallback chain.
+    Returns (reflection_text, source) where source is opencode|agy|fallback.
     """
-    system_prompt = (
-        "- Include multiple natural typing and writing errors: missing apostrophes (e.g. 'dont', 'im', 'cant'), minor casual typos, lowercased sentence start, informal phrasing, missing commas.\n"
-        "- Write like an average 19-year-old college student typing fast on a laptop.\n"
-        "- Min 80 characters, MAX 295 characters (HARD LIMIT - count carefully).\n"
-        "- NO em dashes (— or –), NO AI buzzwords ('delve', 'tapestry', 'furthermore', 'crucial').\n"
-        "- Directly answer the Reflection Prompt Question based on the Article Content.\n\n"
-        f"Article Title: {article_title}\n"
-        f"Article Content:\n{article_body[:2500]}\n"
-        f"Reflection Prompt Question: {prompt_text}\n\n"
-    )
+    if LLM_ABORT.is_set():
+        r = random.choice(_FALLBACKS)
+        return r, "fallback"
+
+    system_prompt = build_reflection_system_prompt(article_title, article_body, prompt_text)
 
     result = _run_llm_prompt(system_prompt)
     if result:
@@ -550,19 +775,166 @@ def call_agy(article_title: str, article_body: str, prompt_text: str) -> tuple[s
         return text, source
 
     r = random.choice(_FALLBACKS)
-    log.warning(f"agy and opencode failed — using hardcoded fallback ({len(r)} chars)")
+    log.warning(f"LLM unavailable — using hardcoded placeholder ({len(r)} chars)")
     return r, "fallback"
 
 
 _last_reflection_logged: tuple[str, str, str] = ("", "", "")
 
 
+def _draft_key(lesson_url: str) -> str:
+    return lesson_url.rstrip("/").replace("/reflect", "")
+
+
+def load_reflection_draft(lesson_url: str) -> Optional[dict]:
+    """Return a saved reflection draft for this lesson URL, if any."""
+    key = _draft_key(lesson_url)
+    try:
+        with open(REFLECTION_DRAFTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        draft = data.get("drafts", {}).get(key)
+        return draft if isinstance(draft, dict) and draft.get("reflection") else None
+    except Exception:
+        return None
+
+
+def save_reflection_draft(
+    lesson_url: str,
+    *,
+    lesson_title: str,
+    article_title: str,
+    reflection: str,
+    source: str,
+    lesson_prompt: str = "",
+) -> None:
+    """Persist reflection until submitted."""
+    text = (reflection or "").strip()
+    if len(text) < REFLECTION_MIN:
+        return
+    key = _draft_key(lesson_url)
+    try:
+        data: dict = {"drafts": {}}
+        if os.path.exists(REFLECTION_DRAFTS_FILE):
+            with open(REFLECTION_DRAFTS_FILE, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        drafts = data.setdefault("drafts", {})
+        drafts[key] = {
+            "lesson_url": key,
+            "lesson_title": lesson_title,
+            "article_title": article_title,
+            "reflection": text,
+            "source": source,
+            "lesson_prompt": lesson_prompt,
+            "saved_at": datetime.now().isoformat(),
+        }
+        with open(REFLECTION_DRAFTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save reflection draft: {e}")
+
+
+def clear_reflection_draft(lesson_url: str) -> None:
+    key = _draft_key(lesson_url)
+    try:
+        if not os.path.exists(REFLECTION_DRAFTS_FILE):
+            return
+        with open(REFLECTION_DRAFTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        drafts = data.get("drafts", {})
+        if key not in drafts:
+            return
+        del drafts[key]
+        with open(REFLECTION_DRAFTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not clear reflection draft: {e}")
+
+
+def _apply_saved_reflection_draft(
+    lesson_url: str, lesson_title: str, article_title: str,
+) -> Optional[tuple[str, str]]:
+    """Load a disk draft and log that it was restored."""
+    saved = load_reflection_draft(lesson_url)
+    if not saved:
+        return None
+    reflection = str(saved.get("reflection", "")).strip()
+    if len(reflection) < REFLECTION_MIN:
+        return None
+    source = str(saved.get("source") or "saved")
+    log.info(
+        f"   ✍️ Loaded saved reflection from disk ({source}, {len(reflection)} chars)"
+    )
+    log_reflection_generated(
+        lesson_title,
+        saved.get("article_title") or article_title,
+        reflection,
+        source,
+        draft_origin="loaded",
+    )
+    return reflection, source
+
+
+def _persist_reflection_draft(
+    lesson: "LessonEntry",
+    article_title: str,
+    reflection: str,
+    source: str,
+    lesson_prompt: str = "",
+    *,
+    draft_origin: str = "generated",
+) -> None:
+    """Save draft to disk and log whether it was freshly generated."""
+    text = (reflection or "").strip()
+    if len(text) < REFLECTION_MIN:
+        return
+    save_reflection_draft(
+        lesson.url,
+        lesson_title=lesson.title,
+        article_title=article_title,
+        reflection=text,
+        source=source,
+        lesson_prompt=lesson_prompt,
+    )
+    if draft_origin == "generated":
+        log.info(f"   ✍️ Generated reflection ({source}, {len(text)} chars) — saved to disk")
+        if source in ("agy", "opencode", "fallback"):
+            log_reflection_generated(
+                lesson.title, article_title, text, source, draft_origin="generated",
+            )
+
+
+async def _reading_llm_with_persist(
+    lesson: "LessonEntry",
+    article_title: str,
+    title: str,
+    body: str,
+    lesson_prompt: str,
+) -> tuple[str, str]:
+    """Run LLM during reading and persist as soon as it finishes (even mid-timer)."""
+    loop = asyncio.get_event_loop()
+    exec_fut = loop.run_in_executor(None, call_agy, title, body, lesson_prompt)
+    _pending_llm_futures.append(exec_fut)
+    try:
+        reflection, reflection_source = await exec_fut
+    finally:
+        if exec_fut in _pending_llm_futures:
+            _pending_llm_futures.remove(exec_fut)
+    _persist_reflection_draft(
+        lesson, article_title, reflection, reflection_source, lesson_prompt,
+        draft_origin="generated",
+    )
+    return reflection, reflection_source
+
+
 def log_reflection_generated(
     lesson_title: str, article_title: str, reflection: str, source: str,
+    *, draft_origin: str = "generated",
 ) -> None:
-    """Write reflection to events.jsonl so menubar can display it immediately."""
+    """Write reflection to events.jsonl so menubar/Telegram can display it."""
     global _last_reflection_logged
-    key = (article_title, reflection, source)
+    key = (article_title, reflection, source, draft_origin)
     if key == _last_reflection_logged:
         return
     _last_reflection_logged = key
@@ -573,6 +945,7 @@ def log_reflection_generated(
         reflection=reflection,
         chars=len(reflection),
         source=source,
+        draft_origin=draft_origin,
     )
 
 
@@ -585,13 +958,15 @@ def try_upgrade_reflection(
     art_title: str, art_body: str, lesson_prompt: str,
     current: str, current_source: str,
 ) -> tuple[str, str]:
-    """Last-chance agy/opencode retry before submit (quota may have reopened)."""
-    log.info("   Pre-submit LLM retry (no agy/opencode draft yet)...")
+    """One pre-submit LLM attempt when reading only produced a placeholder."""
+    if LLM_ABORT.is_set():
+        return current or random.choice(_FALLBACKS), current_source or "fallback"
+    log.info("   Pre-submit LLM upgrade...")
     new_text, new_source = call_agy(art_title, art_body, lesson_prompt)
     if new_source in ("agy", "opencode"):
-        log.info(f"   Pre-submit got {new_source} ({len(new_text)} chars)")
+        log.info(f"   Pre-submit upgrade: {new_source} ({len(new_text)} chars)")
         return new_text, new_source
-    log.info("   Pre-submit retry still fallback — keeping current draft")
+    log.info("   Pre-submit upgrade failed — keeping placeholder draft")
     return current or new_text, current_source or new_source
 
 
@@ -758,19 +1133,133 @@ async def get_timer(page) -> int:
     return await get_timer_light(page)
 
 
-async def get_progress(page) -> dict:
-    try:
-        if await safe_goto(page, f"{BASE_URL}/dashboard"):
-            await page.wait_for_timeout(2000)
+COURSE_HOUR_TOTAL = 75.0
+TYPICAL_LESSON_HOURS = 1.1
+MAX_LESSON_HOURS = 2.0
+
+_PROGRESS_JS = """() => {
+  const DEFAULT_TOTAL = 75;
+  const text = document.body.innerText || '';
+  const candidates = [];
+  const fracRe = /(\\d+(?:\\.\\d+)?)\\s*\\/\\s*(\\d+(?:\\.\\d+)?)\\s*h(?:ours?)?/gi;
+  let m;
+  while ((m = fracRe.exec(text)) !== null) {
+    const done = parseFloat(m[1]), total = parseFloat(m[2]);
+    if (total >= 20) candidates.push({done, total, w: Math.abs(total - DEFAULT_TOTAL)});
+  }
+  const remRe = /(\\d+(?:\\.\\d+)?)\\s*h(?:ours?)?\\s+remaining(?!\\s+today)/gi;
+  while ((m = remRe.exec(text)) !== null) {
+    const rem = parseFloat(m[1]);
+    if (rem > 0 && rem < DEFAULT_TOTAL) {
+      candidates.push({done: DEFAULT_TOTAL - rem, total: DEFAULT_TOTAL, w: 1});
+    }
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => a.w - b.w || Math.abs(a.total - DEFAULT_TOTAL) - Math.abs(b.total - DEFAULT_TOTAL));
+  const best = candidates[0];
+  return {done: best.done, total: best.total, remaining: best.total - best.done};
+}"""
+
+
+def parse_progress_from_body(body: str, default_total: float = COURSE_HOUR_TOTAL) -> dict:
+    """Extract overall course progress; ignore daily limits like 6.1/8 hours."""
+    candidates: list[tuple[float, float, int]] = []
+
+    for m in re.finditer(
+        r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*h(?:ours?)?",
+        body,
+        re.I,
+    ):
+        done, total = float(m.group(1)), float(m.group(2))
+        if total >= 20:
+            candidates.append((done, total, int(abs(total - default_total) * 10)))
+
+    for m in re.finditer(
+        r"(?:Overall\s+)?Progress[^\d]{0,60}(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",
+        body,
+        re.I | re.S,
+    ):
+        done, total = float(m.group(1)), float(m.group(2))
+        if total >= 20:
+            candidates.append((done, total, 0))
+
+    for m in re.finditer(
+        r"(\d+(?:\.\d+)?)\s*h(?:ours?)?\s+remaining(?!\s+today)",
+        body,
+        re.I,
+    ):
+        remaining = float(m.group(1))
+        if 0 < remaining < default_total:
+            candidates.append((default_total - remaining, default_total, 1))
+
+    if not candidates:
+        return {"done": 0.0, "total": default_total, "remaining": default_total}
+
+    done, total, _ = min(candidates, key=lambda c: (c[2], abs(c[1] - default_total)))
+    return {"done": done, "total": total, "remaining": max(0.0, total - done)}
+
+
+async def get_progress(page, *, navigate: bool = True) -> dict:
+    """Read overall hours from dashboard/coursework — never from lesson/reflect pages."""
+    default = {"done": 0.0, "total": COURSE_HOUR_TOTAL, "remaining": COURSE_HOUR_TOTAL}
+    urls = [f"{BASE_URL}/dashboard", f"{BASE_URL}/coursework"] if navigate else [None]
+
+    for url in urls:
+        try:
+            if url and not await safe_goto(page, url):
+                continue
+            if url:
+                await page.wait_for_timeout(2000)
+            js_prog = await page.evaluate(_PROGRESS_JS)
+            if js_prog and float(js_prog.get("done", 0)) > 0:
+                return {
+                    "done": float(js_prog["done"]),
+                    "total": float(js_prog.get("total", COURSE_HOUR_TOTAL)),
+                    "remaining": float(js_prog.get("remaining", 0)),
+                }
             body = await page.inner_text("body")
-        m = re.search(r'(\d+\.?\d*)\s*/\s*(\d+)\s*hours', body)
-        if m:
-            done  = float(m.group(1))
-            total = float(m.group(2))
-            return {"done": done, "total": total, "remaining": total - done}
-    except:
-        pass
-    return {"done": 0.0, "total": 75.0, "remaining": 75.0}
+            parsed = parse_progress_from_body(body)
+            if parsed["done"] > 0:
+                return parsed
+        except Exception:
+            continue
+    return default
+
+
+async def measure_lesson_hours(page, prog_before: dict) -> tuple[dict, float]:
+    """Scrape dashboard after a lesson; correct inflated deltas from wrong-page reads."""
+    prog_after = await get_progress(page, navigate=True)
+    hours_gained = max(0.0, prog_after["done"] - prog_before["done"])
+
+    if hours_gained > MAX_LESSON_HOURS:
+        log.warning(f"   Suspicious hours_gained {hours_gained:.2f} — re-scraping dashboard...")
+        await page.wait_for_timeout(4000)
+        prog_after = await get_progress(page, navigate=True)
+        hours_gained = max(0.0, prog_after["done"] - prog_before["done"])
+
+    if hours_gained > MAX_LESSON_HOURS:
+        rem_before = prog_before.get("remaining")
+        rem_after = prog_after.get("remaining")
+        if rem_before is not None and rem_after is not None:
+            gain_rem = float(rem_before) - float(rem_after)
+            if 0 < gain_rem <= MAX_LESSON_HOURS:
+                hours_gained = gain_rem
+                prog_after = dict(prog_after)
+                prog_after["done"] = prog_before["done"] + hours_gained
+                prog_after["remaining"] = max(0.0, prog_after["total"] - prog_after["done"])
+                log.warning(f"   Corrected via hours-remaining delta: +{hours_gained:.2f}h")
+
+    if hours_gained > MAX_LESSON_HOURS:
+        hours_gained = TYPICAL_LESSON_HOURS
+        prog_after = dict(prog_before)
+        prog_after["done"] = prog_before["done"] + hours_gained
+        prog_after["remaining"] = max(0.0, prog_after["total"] - prog_after["done"])
+        log.warning(
+            f"   Capped lesson credit to typical +{hours_gained:.2f}h "
+            f"(before {prog_before['done']:.1f}h → after {prog_after['done']:.1f}h)"
+        )
+
+    return prog_after, hours_gained
 
 
 async def extract_article(page) -> tuple[str, str]:
@@ -899,7 +1388,7 @@ def _match_url_for_title(title: str, url_map: dict[str, str]) -> Optional[str]:
     return url_map.get(_normalize_title(title))
 
 
-async def fetch_coursework_catalog(page) -> tuple[list[LessonEntry], Optional[str]]:
+async def fetch_coursework_catalog(page, *, log_completed_list: bool = False) -> tuple[list[LessonEntry], Optional[str]]:
     """Scrape /coursework for lesson statuses and build an ordered catalog using robust DOM evaluation."""
     if not await safe_goto(page, f"{BASE_URL}/coursework"):
         log.error("Failed to load coursework page")
@@ -1063,12 +1552,16 @@ async def fetch_coursework_catalog(page) -> tuple[list[LessonEntry], Optional[st
                 "courses": merged_titles,
                 "updated": datetime.now().isoformat()
             }, f, indent=2)
-        log.info("╭────────────────────────────────────────────────────────╮")
-        log.info(f"│ 🎓 COMPLETED COURSES LIST ({len(merged_titles):<27}) │")
-        log.info("├────────────────────────────────────────────────────────┤")
-        for i, title in enumerate(merged_titles, 1):
-            log.info(f"│ {i:2d}. {title}")
-        log.info("╰────────────────────────────────────────────────────────╯")
+        if log_completed_list:
+            clear_live_status()
+            log.info("╭────────────────────────────────────────────────────────╮")
+            log.info(f"│ 🎓 COMPLETED COURSES LIST ({len(merged_titles):<27}) │")
+            log.info("├────────────────────────────────────────────────────────┤")
+            for i, title in enumerate(merged_titles, 1):
+                log.info(f"│ {i:2d}. {title}")
+            log.info("╰────────────────────────────────────────────────────────╯")
+        else:
+            log.debug(f"completed_courses.json updated ({len(merged_titles)} titles)")
     except Exception as e:
         log.error(f"Failed to save completed courses: {e}")
 
@@ -1189,6 +1682,11 @@ async def wait_for_timer(
     last_log_min = -1
 
     while True:
+        if should_stop_work(rs):
+            log.info(f"[{phase}] stopping — daily limit reached")
+            clear_live_status()
+            return
+
         if since_resync >= TIMER_RESYNC_S:
             secs = await get_timer_light(page)
             if secs == -1:
@@ -1261,6 +1759,11 @@ async def reading_phase(
     hours_total: float, rs: Optional[RunState] = None,
 ) -> tuple[str, str, str, str, str]:
     """Returns (article_title, article_body, pre_reflection, lesson_prompt, reflection_source)."""
+    if should_stop_work(rs):
+        raise RuntimeError("Daily limit reached — skipping reading")
+
+    await drain_llm_tasks()
+
     log.info(f"📖 Reading: {lesson.title!r} — {lesson.url}")
     log_event("reading_start", lesson_url=lesson.url, lesson_title=lesson.title,
               hours_today=hours_today, hours_done=hours_done)
@@ -1277,10 +1780,14 @@ async def reading_phase(
         )
     lesson_prompt = default_reflect_prompt(title)
 
-    loop = asyncio.get_event_loop()
-    agy_task = loop.run_in_executor(
-        None, call_agy, title, body, lesson_prompt
-    )
+    saved = _apply_saved_reflection_draft(lesson.url, lesson.title, title)
+    llm_task: Optional[asyncio.Task] = None
+    if saved:
+        reflection, reflection_source = saved
+    else:
+        llm_task = asyncio.create_task(
+            _reading_llm_with_persist(lesson, title, title, body, lesson_prompt)
+        )
 
     secs = await get_timer(page)
     if secs > 0:
@@ -1289,8 +1796,15 @@ async def reading_phase(
     else:
         log.info("   No reading timer")
 
-    reflection, reflection_source = await agy_task
-    log_reflection_generated(lesson.title, title, reflection, reflection_source)
+    if should_stop_work(rs):
+        if llm_task:
+            llm_task.cancel()
+        raise RuntimeError("Daily limit reached — skipping reading draft")
+
+    if llm_task:
+        reflection, reflection_source = await llm_task
+        if reflection_source not in ("agy", "opencode") and reflection:
+            log.info("   Reading-phase LLM pending — will upgrade before submit")
     return title, body, reflection, lesson_prompt, reflection_source
 
 
@@ -1300,6 +1814,10 @@ async def reflect_phase(
     pre_source: str = "",
     rs: Optional[RunState] = None,
 ) -> bool:
+    if should_stop_work(rs):
+        log.info("   Skipping reflect — daily limit reached")
+        return False
+
     reflect_url = lesson.url.rstrip("/") + "/reflect"
     log.info(f"✍️  Reflect: {art_title!r} — {reflect_url}")
     log_event("reflect_start", lesson_url=lesson.url, lesson_title=lesson.title,
@@ -1319,19 +1837,41 @@ async def reflect_phase(
 
     reflection = pre_reflection
     reflection_source = pre_source
-    if reflection and reflection_source not in ("", "fallback"):
-        log.info(f"   Using pre-generated reflection from {reflection_source} ({len(reflection)} chars)")
-    else:
-        if reflection and reflection_source == "fallback":
-            log.info("   Pre-generated reflection was hardcoded fallback — retrying LLM...")
-        else:
-            log.info("   Calling LLM for reflection...")
-        reflection, reflection_source = call_agy(art_title, art_body, lesson_prompt)
+    if not reflection or not reflection.strip():
+        saved = _apply_saved_reflection_draft(lesson.url, lesson.title, art_title)
+        if saved:
+            reflection, reflection_source = saved
 
-    if not (pre_reflection and pre_reflection == reflection and pre_source == reflection_source):
-        log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
+    if reflection and reflection_source not in ("", "fallback"):
+        if pre_reflection and pre_reflection == reflection:
+            log.info(f"   Using pre-generated reflection from {reflection_source} ({len(reflection)} chars)")
+        # loaded drafts already logged in _apply_saved_reflection_draft
+    elif reflection and reflection_source == "fallback":
+        log.info("   Placeholder draft from reading — will try LLM before submit")
+    else:
+        log.info("   Calling LLM for reflection...")
+        reflection, reflection_source = call_agy(art_title, art_body, lesson_prompt)
+        _persist_reflection_draft(
+            lesson, art_title, reflection, reflection_source, lesson_prompt,
+            draft_origin="generated",
+        )
+
+    if reflection_source in ("agy", "opencode") and not (
+        pre_reflection and pre_reflection == reflection and pre_source == reflection_source
+    ):
+        log_reflection_generated(
+            lesson.title, art_title, reflection, reflection_source, draft_origin="generated",
+        )
 
     filled_len = await fill_reflection_textarea(page, reflection)
+    save_reflection_draft(
+        lesson.url,
+        lesson_title=lesson.title,
+        article_title=art_title,
+        reflection=reflection,
+        source=reflection_source,
+        lesson_prompt=lesson_prompt,
+    )
 
     try:
         stars = page.locator("button:has-text('★')")
@@ -1351,15 +1891,29 @@ async def reflect_phase(
         await wait_for_timer(page, "REFLECT", art_title, hours_done, hours_today, hours_total, rs)
 
     if needs_llm_recheck(reflection, reflection_source):
-        loop = asyncio.get_event_loop()
-        upgraded, upgraded_source = await loop.run_in_executor(
-            None, try_upgrade_reflection,
-            art_title, art_body, lesson_prompt, reflection, reflection_source,
-        )
-        if upgraded_source in ("agy", "opencode"):
-            reflection, reflection_source = upgraded, upgraded_source
-            log_reflection_generated(lesson.title, art_title, reflection, reflection_source)
-            filled_len = await fill_reflection_textarea(page, reflection)
+        if should_stop_work(rs):
+            log.info("   Pre-submit skip — daily limit reached")
+        else:
+            loop = asyncio.get_event_loop()
+            upgrade_task = loop.run_in_executor(
+                None, try_upgrade_reflection,
+                art_title, art_body, lesson_prompt, reflection, reflection_source,
+            )
+            _pending_llm_futures.append(upgrade_task)
+            upgraded, upgraded_source = await upgrade_task
+            if upgrade_task in _pending_llm_futures:
+                _pending_llm_futures.remove(upgrade_task)
+            if upgraded_source in ("agy", "opencode"):
+                reflection, reflection_source = upgraded, upgraded_source
+                _persist_reflection_draft(
+                    lesson, art_title, reflection, reflection_source, lesson_prompt,
+                    draft_origin="generated",
+                )
+                log_reflection_generated(
+                    lesson.title, art_title, reflection, reflection_source,
+                    draft_origin="generated",
+                )
+                filled_len = await fill_reflection_textarea(page, reflection)
     else:
         log.info(f"   Pre-submit skip — already have {reflection_source} draft")
 
@@ -1392,6 +1946,7 @@ async def reflect_phase(
 
     if success:
         log.info(f"   ✅ Submitted: {art_title!r}")
+        clear_reflection_draft(lesson.url)
     else:
         log.warning(f"   ⚠️  Submission unconfirmed: {art_title!r}")
 
@@ -1778,18 +2333,33 @@ async def process_lesson(
                     art_title = t
                 if b:
                     art_body = b
+        saved = load_reflection_draft(lesson.url)
+        if saved:
+            reflection = str(saved.get("reflection", ""))
+            reflection_source = str(saved.get("source") or "")
+            if reflection:
+                log.info(
+                    f"   ✍️ Restored saved reflection for reflect phase "
+                    f"({reflection_source}, {len(reflection)} chars)"
+                )
+                log_reflection_generated(
+                    lesson.title,
+                    saved.get("article_title") or art_title,
+                    reflection,
+                    reflection_source,
+                    draft_origin="loaded",
+                )
         log.info(f"   Reading already complete — going to reflect for {art_title!r}")
 
 
-    prog_before = await get_progress(page)
+    prog_before = await get_progress(page, navigate=True)
     success = await reflect_phase(
         page, lesson, art_title, art_body, reflection,
         prog_before["done"], hours_today, prog_before["total"],
         pre_source=reflection_source, rs=rs,
     )
 
-    prog_after = await get_progress(page)
-    hours_gained = max(0.0, prog_after["done"] - prog_before["done"])
+    prog_after, hours_gained = await measure_lesson_hours(page, prog_before)
 
     if success:
         completed_path = os.path.join(ROOT_DIR, "completed_courses.json")
@@ -1832,14 +2402,7 @@ async def process_lesson(
             with open(bot_completed_path, "w", encoding="utf-8") as f:
                 json.dump({"count": len(b_courses), "courses": b_courses, "updated": datetime.now().isoformat()}, f, indent=2)
             log_event("bot_completed_courses_snapshot", count=len(b_courses), courses=b_courses)
-            
-            log.info("╭────────────────────────────────────────────────────────╮")
-            log.info(f"│ 🤖 BOT COMPLETED COURSES ({len(b_courses):<28}) │")
-            log.info("├────────────────────────────────────────────────────────┤")
-            for i, c in enumerate(b_courses, 1):
-                t = c.get("title") if isinstance(c, dict) else c
-                log.info(f"│ {i}. {t}")
-            log.info("╰────────────────────────────────────────────────────────╯")
+            log.info(f"   ✓ Bot completed: {lesson.title!r} ({len(b_courses)} total)")
         except Exception as e:
             log.error(f"Failed to update bot completed courses: {e}")
 
@@ -1884,12 +2447,17 @@ async def _main_inner():
     hours_today_start = get_today_hours_from_log()
     log.info(f"📅 Hours logged today (events): {hours_today_start:.1f}h")
 
+    ensure_playwright_browsers_path()
+
     async with async_playwright() as p:
-        log.info("🌐 Launching browser...")
-        browser = await p.chromium.launch(
-            headless=not bool(os.getenv("HEADED")),
-            args=["--disable-dev-shm-usage", "--no-sandbox", "--disable-gpu", "--blink-settings=imagesEnabled=true"],
-        )
+        try:
+            browser = await launch_browser(p)
+        except asyncio.TimeoutError:
+            log.error("Browser launch timed out after 90s — check Playwright install")
+            sys.exit(1)
+        except RuntimeError as e:
+            log.error(str(e))
+            sys.exit(1)
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -1908,11 +2476,6 @@ async def _main_inner():
             sys.exit(1)
         log.info("   ✓ Logged in")
 
-        log.info("📊 Loading dashboard progress...")
-        prog = await get_progress(page)
-        log_event("progress_snapshot", **prog)
-        log.info(f"   ✓ {prog['done']:.1f}h / {prog['total']:.0f}h ({prog['remaining']:.1f}h remaining)")
-
         log.info("📅 Checking daily hour limit...")
         daily = await get_daily_status(page)
         hours_today = daily["hours_today"]
@@ -1922,34 +2485,46 @@ async def _main_inner():
             f"(source: {daily['source']})"
         )
 
-        log.info("👤 Loading user profile...")
-        user_info = await get_user_profile(page)
-        log.info("   ✓ Profile loaded")
-
-        log.info("📚 Scraping coursework catalog...")
-        lessons, _cta_url = await fetch_coursework_catalog(page)
-        catalog_done = sum(1 for l in lessons if l.status == "done")
-        log.info(f"   ✓ {len(lessons)} lessons ({catalog_done} done on site)")
-
-        log_user_profile(user_info, prog, hours_today, catalog_done)
-        log_catalog_summary(lessons)
-        log_completion_breakdown(lessons)
-
         rs = RUN_STATE
-        rs.hours_done = prog["done"]
-        rs.hours_total = prog["total"]
-        rs.hours_remaining = prog["remaining"]
         rs.hours_today = hours_today
-        rs.catalog_done = catalog_done
-        rs.queue_total = len(lessons)
-        rs.user_name = (
-            user_info.get("FULL NAME") or user_info.get("Full Name") or user_info.get("name") or ""
-        ).strip()
+        at_limit = check_daily_limit(hours_today, hours_remaining_today)
 
-        if check_daily_limit(hours_today, hours_remaining_today):
-            rs.phase = "LIMIT_WAIT"
-            rs.title = "Daily limit — waiting for midnight reset"
-            await wait_for_daily_reset(page, rs)
+        if at_limit:
+            log.info("📊 Quick progress read (limit reached — skipping profile & catalog)...")
+            prog = await get_progress(page)
+            log_event("progress_snapshot", **prog)
+            log.info(f"   ✓ {prog['done']:.1f}h / {prog['total']:.0f}h ({prog['remaining']:.1f}h remaining)")
+            rs.hours_done = prog["done"]
+            rs.hours_total = prog["total"]
+            rs.hours_remaining = prog["remaining"]
+            await enter_limit_wait(page, rs)
+        else:
+            log.info("📊 Loading dashboard progress...")
+            prog = await get_progress(page)
+            log_event("progress_snapshot", **prog)
+            log.info(f"   ✓ {prog['done']:.1f}h / {prog['total']:.0f}h ({prog['remaining']:.1f}h remaining)")
+
+            log.info("👤 Loading user profile...")
+            user_info = await get_user_profile(page)
+            log.info("   ✓ Profile loaded")
+
+            log.info("📚 Scraping coursework catalog...")
+            lessons, _cta_url = await fetch_coursework_catalog(page, log_completed_list=True)
+            catalog_done = sum(1 for l in lessons if l.status == "done")
+            log.info(f"   ✓ {len(lessons)} lessons ({catalog_done} done on site)")
+
+            log_user_profile(user_info, prog, hours_today, catalog_done)
+            log_catalog_summary(lessons)
+            log_completion_breakdown(lessons)
+
+            rs.hours_done = prog["done"]
+            rs.hours_total = prog["total"]
+            rs.hours_remaining = prog["remaining"]
+            rs.catalog_done = catalog_done
+            rs.queue_total = len(lessons)
+            rs.user_name = (
+                user_info.get("FULL NAME") or user_info.get("Full Name") or user_info.get("name") or ""
+            ).strip()
 
         CAFFEINATE_MANAGER.start()
 
@@ -1972,7 +2547,7 @@ async def _main_inner():
             rs.hours_today = hours_today
 
             if check_daily_limit(hours_today, hours_remaining_today):
-                await wait_for_daily_reset(page, rs)
+                await enter_limit_wait(page, rs)
                 CAFFEINATE_MANAGER.start()
                 continue
 

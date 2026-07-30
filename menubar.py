@@ -71,6 +71,10 @@ def _subprocess_env(extra=None) -> dict:
     env = os.environ.copy()
     for key in _MALLOC_ENV_KEYS:
         env.pop(key, None)
+    default_pw = os.path.expanduser("~/Library/Caches/ms-playwright")
+    cur = env.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if not cur or "cursor-sandbox-cache" in cur.replace("\\", "/"):
+        env["PLAYWRIGHT_BROWSERS_PATH"] = default_pw
     if extra:
         env.update(extra)
     return env
@@ -110,6 +114,65 @@ def format_timer_remaining(end_ts: float) -> str:
         return "N/A"
     mins, s = secs // 60, secs % 60
     return f"{mins}m {s}s" if s else f"{mins}m"
+
+
+def _event_limit_resume_indices(events: list) -> tuple[int, int, int]:
+    """Return (last_limit_idx, last_resume_idx, last_timer_idx) for menubar state."""
+    last_limit = -1
+    last_resume = -1
+    last_timer = -1
+    for idx, ev in enumerate(events):
+        name = ev.get("event", "")
+        if name in ("daily_limit_wait_start", "daily_limit_hit"):
+            last_limit = idx
+        elif name in (
+            "daily_limit_reset_detected",
+            "daily_limit_wait_complete",
+            "reading_start",
+            "lesson_start",
+        ):
+            last_resume = idx
+        elif name in ("timer_sync", "timer_tick"):
+            last_timer = idx
+    return last_limit, last_resume, last_timer
+
+
+def _should_clear_lesson_timers(events: list) -> bool:
+    """Clear read/reflect timers only if limit/complete is newer than the latest timer_sync."""
+    _last_limit, _last_resume, last_timer = _event_limit_resume_indices(events)
+    last_clear = -1
+    for idx, ev in enumerate(events):
+        if ev.get("event") in ("lesson_complete", "daily_limit_wait_start", "daily_limit_hit"):
+            last_clear = idx
+    if last_clear == -1:
+        return False
+    return last_timer == -1 or last_clear > last_timer
+
+
+def _is_event_limit_wait(events: list) -> bool:
+    last_limit, last_resume, _ = _event_limit_resume_indices(events)
+    if last_limit == -1:
+        return False
+    return last_resume == -1 or last_limit > last_resume
+
+
+def _resolve_limit_wait_state(
+    *,
+    event_limit_wait: bool,
+    log_limit_wait: bool,
+    is_resuming: bool,
+    read_timer_active: bool,
+    reflect_timer_active: bool,
+) -> bool:
+    """
+    Daily limit wait overrides 'bot is running' — the engine stays alive but rests.
+    Active read/reflect timers always win (real coursework in progress).
+    """
+    if read_timer_active or reflect_timer_active:
+        return False
+    if is_resuming:
+        return False
+    return event_limit_wait or log_limit_wait
 
 
 def estimate_days_to_complete(hours_remaining: float, hours_today: float = 0.0, daily_limit: float = 8.0) -> int:
@@ -664,13 +727,22 @@ class TFCCourseworkMenuApp(rumps.App):
 
                     if "retrying in 2 minutes" in line or "Reset not updated on site yet" in line:
                         state["retrying_after_midnight"] = True
-                    if "[LIMIT_WAIT]" in line or "LIMIT REACHED" in line:
-                        state["log_limit_wait"] = True
-                        m_rem = re.search(r"⏱\s*(\d+h\s*\d+m)", line)
-                        if m_rem:
-                            state["limit_timer"] = m_rem.group(1)
+                    if (
+                        "Limit reset confirmed" in line
+                        or "Resuming coursework" in line
+                        or "daily_limit_wait_complete" in line
+                    ):
+                        state["log_limit_wait"] = False
+                        state["retrying_after_midnight"] = False
                         break
-                    if "[READ]" in line or "[REFLECT]" in line:
+                    if (
+                        "📖 Reading:" in line
+                        or "✍️  Reflect:" in line
+                        or "Reflect:" in line
+                        or "Reading timer:" in line
+                        or "[READ]" in line
+                        or "[REFLECT]" in line
+                    ):
                         state["log_limit_wait"] = False
                         m_l = re.search(r"Lesson #[^\s']+", line)
                         if m_l:
@@ -680,10 +752,16 @@ class TFCCourseworkMenuApp(rumps.App):
                             parsed_time = (
                                 m_t.group(1).replace("min remaining", "m").replace("min", "m").strip()
                             )
-                            if "[READ]" in line:
+                            if "[READ]" in line or "Reading" in line:
                                 state["read_timer"] = parsed_time
                             else:
                                 state["reflect_timer"] = parsed_time
+                        break
+                    if "[LIMIT_WAIT]" in line or "DAILY LIMIT REACHED" in line or "LIMIT REACHED" in line:
+                        state["log_limit_wait"] = True
+                        m_rem = re.search(r"⏱\s*(\d+h\s*\d+m)", line)
+                        if m_rem:
+                            state["limit_timer"] = m_rem.group(1)
                         break
         except Exception:
             pass
@@ -835,11 +913,9 @@ class TFCCourseworkMenuApp(rumps.App):
                     self._read_timer_end = 0.0
                 break
 
-            for ev in reversed(events):
-                if ev.get("event") in ("lesson_complete", "daily_limit_wait_start", "daily_limit_hit"):
-                    self._read_timer_end = 0.0
-                    self._reflect_timer_end = 0.0
-                    break
+            if _should_clear_lesson_timers(events):
+                self._read_timer_end = 0.0
+                self._reflect_timer_end = 0.0
                         
             # Get today's hours if available (date matching today)
             today_str = datetime.now().strftime("%Y-%m-%d")
@@ -1108,38 +1184,32 @@ class TFCCourseworkMenuApp(rumps.App):
             except Exception:
                 pass
 
-        event_limit_wait = False
+        event_limit_wait = _is_event_limit_wait(events) if events else False
         is_resuming = False
         if events:
-            last_limit_wait = -1
-            last_resume = -1
-            for idx, ev in enumerate(events):
-                ev_name = ev.get("event")
-                if ev_name in ("daily_limit_wait_start", "daily_limit_hit"):
-                    last_limit_wait = idx
-                elif ev_name in ("daily_limit_reset_detected", "reading_start", "lesson_start"):
-                    # NOTE: "bot_start" is intentionally NOT included here so logging bot_start DOES NOT clear is_limit_wait
-                    last_resume = idx
-            
-            if last_limit_wait != -1 and last_limit_wait > last_resume:
-                event_limit_wait = True
-            elif last_resume > last_limit_wait and last_limit_wait != -1:
+            last_limit, last_resume, _ = _event_limit_resume_indices(events)
+            if last_resume > last_limit and last_limit != -1:
                 is_resuming = True
+
+        # Stale lesson timers must not mask daily limit wait
+        if event_limit_wait or log_limit_wait:
+            self._read_timer_end = 0.0
+            self._reflect_timer_end = 0.0
+            read_timer_str = "N/A"
+            submit_timer_str = "N/A"
 
         try:
             hrs_today_f = float(getattr(self, 'hours_today', 0.0))
         except (ValueError, TypeError):
             hrs_today_f = 0.0
 
-        # Master is_limit_wait determination:
-        # Active reading/reflection timer or [READ]/[REFLECT] log overrides limit wait
-        if read_timer_str != "N/A" or submit_timer_str != "N/A":
-            is_limit_wait = False
-            is_retrying_after_midnight = False
-        elif hrs_today_f >= 8.0 or log_limit_wait or event_limit_wait:
-            is_limit_wait = True
-        else:
-            is_limit_wait = False
+        is_limit_wait = _resolve_limit_wait_state(
+            event_limit_wait=event_limit_wait,
+            log_limit_wait=log_limit_wait,
+            is_resuming=is_resuming,
+            read_timer_active=read_timer_str != "N/A",
+            reflect_timer_active=submit_timer_str != "N/A",
+        )
 
         # Calculate time until local midnight (12:00 AM local time)
         now = datetime.now()
@@ -1209,7 +1279,7 @@ class TFCCourseworkMenuApp(rumps.App):
             self.item_status.title = f"🌙 {status_text}"
             self.item_queue_today.title = f"📅 Logged Today:  [{daily_bar}] {daily_pct}% ({hrs_today_f:.1f} / 8.0h - Limit Hit)"
             
-        elif bot_active:
+        elif bot_active and not is_limit_wait:
             new_state_id = "ACTIVE"
             icon = "🟢"
             if read_timer_str != "N/A":
@@ -1248,7 +1318,7 @@ class TFCCourseworkMenuApp(rumps.App):
         display = getattr(self, 'display_mode', 'auto')
         
         lesson_title_trunc = ""
-        if bot_active and new_state_id == "ACTIVE" and self.current_lesson and self.current_lesson != "None":
+        if bot_active and not is_limit_wait and new_state_id == "ACTIVE" and self.current_lesson and self.current_lesson != "None":
             lt = self.current_lesson.replace("Lesson #", "").strip()
             if len(lt) > 12:
                 lt = lt[:11].strip() + "…"

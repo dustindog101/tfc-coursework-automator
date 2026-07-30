@@ -94,7 +94,9 @@ Prefer a clean menu bar interface? Launch `./run_menubar.sh` for a lightweight m
 | Feature | Description |
 | :--- | :--- |
 | **🍏 Native macOS Menu Bar App** | Built on PyObjC (`rumps`) using < 15MB RAM and 30KB disk. Shows live timers, upcoming reflections, profile stats, and history. |
-| **🧠 Asynchronous AI Reflections** | Uses Gemini 3.6 Flash via `agy` CLI to write authentic, college-freshman level reflections (80–295 chars, no em dashes, casual tone) in background threads. |
+| **🧠 Asynchronous AI Reflections** | OpenCode (DeepSeek / MiMo) first, then `agy` Gemini fallback. Reflections save to disk until submitted — survives restarts mid-timer. |
+| **💾 Reflection Draft Persistence** | `reflection_drafts.json` stores each lesson's draft until submit. CLI and Telegram show **generated** vs **loaded from disk**. |
+| **📱 Live Telegram Lesson Card** | One pinned message per article; edits every ~60s during timers (phase, progress bar, countdown, draft). |
 | **🔍 Smart Catalog Discovery** | Scrapes `/coursework` to categorize lessons into *Done*, *Needs Reading*, and *Needs Reflection*, allowing instant resume after interruptions. |
 | **⏱️ Dual Timer Support** | Intelligently handles both the **article reading countdown** and the **reflection submit-lock timer** on the page. |
 | **🌙 Daily Limit Auto-Wait** | Detects when today's 8.0h limit is reached, notifies you, displays a live reset countdown, and resumes automatically at midnight. |
@@ -115,8 +117,8 @@ Get coursework updates on your phone without staring at the terminal.
 | :--- | :--- |
 | Bot started / stopped | Engine online or session summary |
 | **Live lesson message** | **One message per article** — edits in place as the bot progresses |
-| → Reading | Phase + today's hour bar (`3.2 / 8 h`) |
-| → Reflection draft | Appends the AI-generated reflection text |
+| → Reading | Phase + today's bar + timer (updates ~every 60s) |
+| → Reflection draft | Shows **generated** or **loaded from disk** + preview text |
 | → Reflection | Phase switches to ✍️ Reflection |
 | → Submitted | Marks reflection submitted ✓ |
 | → Lesson complete | Final summary with hours gained |
@@ -214,30 +216,52 @@ TFC_DAILY_HOUR_LIMIT=8.0
 
 ### 3. Launch the Automator
 
-**Option A: Launch Native macOS Menu Bar App (Recommended)**
+**Option A: macOS Menu Bar + live log (recommended)**
 ```bash
 ./run_menubar.sh
 ```
-Streams live bot output in the terminal and starts the menu bar app.
+Shows `automation.log` in the terminal and a menu bar icon. During coursework you'll see `📖` / `✍️` timers; at the daily limit the icon switches to `🌙` (the engine keeps running but rests until midnight).
 
-**Option B: Foreground CLI (full terminal output)**
+**Option B: Foreground CLI**
 ```bash
 ./run_cli.sh
 ```
 
-**Option C: Launch Terminal Runner (Headed / Visible Browser)**
+**Option C: Headed browser with auto-restart**
 ```bash
 ./run.sh
 ```
 
-**Option D: Launch Terminal Runner (Headless / Background Browser)**
+**Option D: Headless background**
 ```bash
 HEADED=0 ./run.sh
 ```
 
+### 4. Optional — Telegram on your phone
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) and add `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ENABLED=1` to `.env`
+2. Start the automator, then message your bot **`/start`**
+3. Toggle push in **Menubar → Settings → Telegram Notifications**
+
+You'll get one live lesson message that updates as the bot reads, drafts, and submits. Use `/status` anytime for an on-demand snapshot.
+
+See [docs/TELEGRAM.md](docs/TELEGRAM.md) for details.
+
 ---
 
-## ⚙️ Environment Configuration
+## 🔄 After a restart
+
+The bot resumes mid-lesson automatically (`inspect_lesson` detects reading vs reflect). **Reflection drafts** are restored from `reflection_drafts.json` if the bot shut down during a timer — look for:
+
+```text
+✍️ Loaded saved reflection from disk (opencode, 312 chars)
+```
+
+Drafts are **per lesson URL** and deleted only after a confirmed submit.
+
+---
+
+## ⚙️ Environment Configuration (reference)
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
@@ -248,6 +272,10 @@ HEADED=0 ./run.sh
 | `HEADED` | `1` | `1` = visible browser window, `0` = background headless |
 | `TELEGRAM_BOT_TOKEN` | — | BotFather token for optional Telegram notifications |
 | `TELEGRAM_ENABLED` | `0` | `1` = enable Telegram push (also toggle in menubar) |
+| `OPENCODE_MODEL` | `deepseek-v4-flash-free,mimo-v2.5-free` | Comma-separated OpenCode models (tried in order) |
+| `OPENCODE_VARIANT` | `minimal` | OpenCode variant flag |
+| `TELEGRAM_LESSON_EDIT_INTERVAL_S` | `60` | How often the live Telegram lesson card refreshes during timers |
+| `TFC_REFLECTION_DRAFTS_FILE` | `./reflection_drafts.json` | Saved reflections until submit (gitignored) |
 | `ENABLE_CAFFEINATE` | `1` | Keep Mac awake during active coursework |
 
 ---

@@ -52,6 +52,10 @@ A machine owner (Host User) can manage and automate coursework for up to **20 di
 ### 🎯 Phase 1: Multi-Account Configuration Registry (`v4.5`)
 - [x] Single-account Headless engine with Gemini Flash AI.
 - [x] Native macOS Menu Bar status app with live timers and local 12-hour AM/PM formatting.
+- [x] **OpenCode-first LLM chain** (DeepSeek / MiMo) with agy fallback and meta-output rejection.
+- [x] **Reflection draft persistence** (`reflection_drafts.json`) — survives shutdown during timers.
+- [x] **Live Telegram lesson card** — in-place edits with timer/progress refresh (~60s).
+- [x] **Menubar limit-wait state** — `🌙` when resting at daily cap (even while engine process runs).
 - [ ] **Multi-Credential Store (`config/accounts.json`)**: Support defining up to 20 account profiles with isolated credentials and target hours.
 - [ ] **Isolated Session Storage**: Store auth cookies in `.auth_state_<user_id>.json` to ensure zero session collisions.
 
@@ -81,7 +85,13 @@ A machine owner (Host User) can manage and automate coursework for up to **20 di
 
 ---
 
-### 🚀 Phase 2: Parallel Worker Pool Orchestrator (`v5.0`)
+### 🔮 Near-term single-account polish (`v4.2`)
+- [ ] **Midnight limit-wait Telegram countdown** — live edits to the daily-limit message (like lesson cards).
+- [ ] **Reflection draft UI in menubar** — show "loaded" vs "generated" badge next to draft preview.
+- [ ] **Smarter progress scrape** — fewer false hour spikes after lesson submit.
+- [ ] **OpenCode health probe** on startup — log which models are reachable before first lesson.
+
+---
 - [ ] **Worker Process Pool Manager (`orchestrator.py`)**: Spawns up to 20 lightweight Playwright headless workers.
 - [ ] **Resource & Memory Throttling**:
   - Headless Chromium instances use < 80MB RAM per worker.
