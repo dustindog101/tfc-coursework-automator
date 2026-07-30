@@ -209,11 +209,44 @@ class TestTelegramActions(unittest.TestCase):
         self.assertEqual(tg.drain_actions_for_lesson("https://example.org/lesson-1"), [])
 
     def test_lesson_keyboard_on_reflect(self):
-        kb = tg._lesson_card_keyboard("reflect")
+        kb = tg._lesson_card_keyboard("reflect", "Sample article body for copy.")
         self.assertIsNotNone(kb)
         labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
         self.assertIn("🔄 Regenerate", labels)
         self.assertIn("📋 Article text", labels)
+        article_btn = kb["inline_keyboard"][-1][0]
+        self.assertEqual(article_btn["callback_data"], "tfc:article")
+
+    def test_lesson_card_shows_overlay(self):
+        tg.set_card_overlay("🔄 Queued — new AI draft incoming (usually within 60s).")
+        card = tg._build_lesson_card(
+            lesson_title="L1",
+            phase="reading",
+            reflection="draft text here" + "x" * 80,
+        )
+        self.assertIn("Queued", card)
+        tg.clear_card_overlay()
+
+    @patch.object(tg, "send_message", return_value=1)
+    def test_send_article_message(self, mock_send):
+        ok = tg._send_article_message(12345)
+        self.assertTrue(ok)
+        mock_send.assert_called_once()
+        body = mock_send.call_args[0][1]
+        self.assertIn("<pre>", body)
+        self.assertIn("Body text here", body)
+
+    @patch.object(tg, "send_message", return_value=1)
+    def test_send_article_message_splits_very_long(self, mock_send):
+        tg.set_lesson_context(
+            lesson_url="https://example.org/lesson-1",
+            lesson_title="Lesson 1",
+            article_title="Long Article",
+            article_body="x" * 5000,
+        )
+        ok = tg._send_article_message(12345)
+        self.assertTrue(ok)
+        self.assertEqual(mock_send.call_count, 2)
 
     def test_lesson_keyboard_hidden_when_submitted(self):
         self.assertIsNone(tg._lesson_card_keyboard("submitted"))

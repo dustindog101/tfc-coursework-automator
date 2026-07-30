@@ -546,10 +546,26 @@ _LLM_META_MARKERS = (
     "no preamble",
     "meta-commentary",
     "style check",
+    "style checks",
+    "missing apostrophes",
+    "forbidden buzzwords",
+    "informal phrasing",
+    "lowercased start",
+    "no em-dash",
+    "no em dash",
+    "answers the prompt directly",
+    "reply format",
     "hard limit",
     "characters (hard",
     "guidelines",
     "do not include",
+    "includes missing",
+    "no forbidden",
+)
+
+_META_LINE_PREFIX = re.compile(
+    r"^(style\s*checks?|reply\s*format|output\s*rules|voice|length)\s*:",
+    re.IGNORECASE,
 )
 
 
@@ -594,13 +610,28 @@ def _clean_llm_text(text: str) -> str:
 
 
 def _line_looks_like_meta(line: str) -> bool:
-    low = line.lower()
+    low = line.lower().strip()
+    if _META_LINE_PREFIX.match(low):
+        return True
     return any(marker in low for marker in _LLM_META_MARKERS)
+
+
+def _strip_meta_lines(text: str) -> str:
+    """Drop instruction-echo lines; keep prose paragraphs."""
+    kept = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if _line_looks_like_meta(s):
+            continue
+        kept.append(s)
+    return "\n".join(kept).strip()
 
 
 def _llm_output_is_invalid(text: str) -> bool:
     """Reject instruction echoes, meta commentary, or too-short replies."""
-    cleaned = (text or "").strip()
+    cleaned = _strip_meta_lines((text or "").strip())
     if len(cleaned) < REFLECTION_MIN:
         return True
     low = cleaned.lower()
@@ -608,10 +639,13 @@ def _llm_output_is_invalid(text: str) -> bool:
         return True
     if cleaned.count("\n") >= 2 and ("- " in cleaned or "• " in cleaned):
         return True
+    if low.startswith("reflection:") and len(cleaned) < REFLECTION_MIN + 12:
+        return True
     return False
 
 
 def _extract_prose(text: str) -> str:
+    text = _strip_meta_lines(_clean_llm_text(text))
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     candidates = [
         l for l in reversed(lines)
@@ -621,6 +655,7 @@ def _extract_prose(text: str) -> str:
         and not _line_looks_like_meta(l)
     ]
     prose = candidates[0] if candidates else text
+    prose = re.sub(r"^(reflection|answer)\s*:\s*", "", prose, flags=re.IGNORECASE).strip()
     if _llm_output_is_invalid(prose):
         return ""
     return prose[:REFLECTION_MAX]
@@ -1267,6 +1302,16 @@ async def extract_article(page) -> tuple[str, str]:
     title = "Community Service Article"
     body = ""
     try:
+        if "/reflect" in page.url:
+            base_url = page.url.split("/reflect")[0]
+            if base_url:
+                log.info("   extract_article: on /reflect — navigating to article page")
+                if await safe_goto(page, base_url):
+                    await page.wait_for_timeout(1000)
+                else:
+                    log.info("   extract_article: could not leave /reflect — skipping body")
+                    return title, body
+
         for sel in ["h1", "h2", ".article-title", ".lesson-title", ".course-title"]:
             el = page.locator(sel).first
             if await el.count() > 0:
@@ -1276,7 +1321,7 @@ async def extract_article(page) -> tuple[str, str]:
                     break
 
         if "/reflect" in page.url:
-            log.info("   extract_article: on /reflect page — skipping body extraction")
+            log.info("   extract_article: still on /reflect — skipping body extraction")
             return title, body
 
         extracted_body = await page.evaluate('''() => {
@@ -1634,14 +1679,27 @@ async def inspect_lesson(page, lesson: LessonEntry) -> str:
 
     # Step 1: Check reading URL first (resilient detection of active reading timer)
     if await safe_goto(page, lesson.url):
-        secs = await get_timer(page)
-        body = await page.inner_text("body")
-        if secs > 0:
-            log.info(f"   → Needs reading (timer active {secs//60}:{secs%60:02d}): {lesson.title!r}")
-            return "needs_read"
-        if "Time Remaining" in body and "REFLECTION FOR" not in body:
-            log.info(f"   → Needs reading (timer on page): {lesson.title!r}")
-            return "needs_read"
+        if "/reflect" in page.url:
+            body = await page.inner_text("body")
+            if any(kw in body for kw in ["Reflection Submitted", "Next Article", "Great work"]):
+                log.info(f"   ✓ Reflection already submitted: {lesson.title!r}")
+                return "complete"
+            if await page_has_reflect_form(page):
+                log.info(f"   → Needs reflect (redirected to /reflect): {lesson.title!r}")
+                return "needs_reflect"
+            secs = await get_timer(page)
+            if secs > 0:
+                log.info(f"   → Needs reflect (timer on /reflect {secs//60}:{secs%60:02d}): {lesson.title!r}")
+                return "needs_reflect"
+        else:
+            secs = await get_timer(page)
+            body = await page.inner_text("body")
+            if secs > 0:
+                log.info(f"   → Needs reading (timer active {secs//60}:{secs%60:02d}): {lesson.title!r}")
+                return "needs_read"
+            if "Time Remaining" in body and "REFLECTION FOR" not in body:
+                log.info(f"   → Needs reading (timer on page): {lesson.title!r}")
+                return "needs_read"
 
     # Step 2: Check reflect URL (resilient detection of submitted or active reflection timer)
     if await safe_goto(page, reflect_url):
@@ -1679,54 +1737,113 @@ async def _handle_telegram_reflection_actions(
     *,
     page=None,
     fill_form: bool = False,
+    handler: Optional["_TelegramActionHandler"] = None,
 ) -> tuple[str, str]:
-    """Apply Telegram regenerate/custom actions. Never raises — bot keeps going."""
-    try:
-        import telegram_notify as tg
-        actions = tg.drain_actions_for_lesson(lesson.url)
-    except Exception as e:
-        log.warning(f"Telegram actions skipped: {e}")
-        return reflection, reflection_source
+    """Apply Telegram regenerate/custom actions. Never blocks on LLM — bot keeps going."""
+    if handler is None:
+        handler = _TelegramActionHandler()
+    return await handler.poll(
+        lesson, art_title, art_body, lesson_prompt,
+        reflection, reflection_source,
+        page=page, fill_form=fill_form,
+    )
 
-    for action in actions:
-        atype = action.get("type")
-        if atype == "regenerate":
-            log.info("   📱 Telegram: regenerating reflection…")
-            loop = asyncio.get_event_loop()
-            new_r, new_s = await loop.run_in_executor(
-                None, call_agy, art_title, art_body, lesson_prompt,
-            )
-            if new_r and len(new_r.strip()) >= REFLECTION_MIN:
-                reflection, reflection_source = new_r, new_s
-                _persist_reflection_draft(
-                    lesson, art_title, reflection, reflection_source, lesson_prompt,
-                    draft_origin="generated",
-                )
-                log_reflection_generated(
-                    lesson.title, art_title, reflection, reflection_source,
-                    draft_origin="generated",
-                )
-                log.info(f"   📱 New draft ({reflection_source}, {len(reflection)} chars)")
-        elif atype == "custom":
-            text = str(action.get("text", "")).strip()
-            if len(text) >= REFLECTION_MIN:
-                reflection = text[:REFLECTION_MAX]
-                reflection_source = "telegram"
-                _persist_reflection_draft(
-                    lesson, art_title, reflection, reflection_source, lesson_prompt,
-                    draft_origin="loaded",
-                )
-                log.info(f"   📱 Using your Telegram reflection ({len(reflection)} chars)")
-                log_reflection_generated(
-                    lesson.title, art_title, reflection, reflection_source,
-                    draft_origin="loaded",
-                )
+
+class _TelegramActionHandler:
+    """Non-blocking Telegram actions — regenerate runs in a background executor."""
+
+    def __init__(self) -> None:
+        self._regen_future: Optional[asyncio.Future] = None
+
+    async def poll(
+        self,
+        lesson: "LessonEntry",
+        art_title: str,
+        art_body: str,
+        lesson_prompt: str,
+        reflection: str,
+        reflection_source: str,
+        *,
+        page=None,
+        fill_form: bool = False,
+    ) -> tuple[str, str]:
+        try:
+            import telegram_notify as tg
+            actions = tg.drain_actions_for_lesson(lesson.url)
+        except Exception as e:
+            log.warning(f"Telegram actions skipped: {e}")
+            return reflection, reflection_source
+
+        for action in actions:
+            atype = action.get("type")
+            if atype == "regenerate":
+                if self._regen_future is None or self._regen_future.done():
+                    log.info("   📱 Telegram: regenerating reflection (background)…")
+                    try:
+                        import telegram_notify as tg
+                        tg.set_card_overlay("🔄 Queued — new AI draft incoming (usually within 60s).")
+                    except Exception:
+                        pass
+                    loop = asyncio.get_running_loop()
+                    self._regen_future = loop.run_in_executor(
+                        None, call_agy, art_title, art_body, lesson_prompt,
+                    )
+            elif atype == "custom":
+                text = str(action.get("text", "")).strip()
+                if len(text) >= REFLECTION_MIN:
+                    reflection = text[:REFLECTION_MAX]
+                    reflection_source = "telegram"
+                    _persist_reflection_draft(
+                        lesson, art_title, reflection, reflection_source, lesson_prompt,
+                        draft_origin="loaded",
+                    )
+                    log.info(f"   📱 Using your Telegram reflection ({len(reflection)} chars)")
+                    log_reflection_generated(
+                        lesson.title, art_title, reflection, reflection_source,
+                        draft_origin="loaded",
+                    )
+                    try:
+                        import telegram_notify as tg
+                        tg.set_card_overlay(f"✅ Using your reflection ({len(reflection)} chars)")
+                    except Exception:
+                        pass
+
+        if self._regen_future is not None and self._regen_future.done():
+            try:
+                new_r, new_s = self._regen_future.result()
+                if new_r and len(new_r.strip()) >= REFLECTION_MIN:
+                    reflection, reflection_source = new_r, new_s
+                    _persist_reflection_draft(
+                        lesson, art_title, reflection, reflection_source, lesson_prompt,
+                        draft_origin="generated",
+                    )
+                    log_reflection_generated(
+                        lesson.title, art_title, reflection, reflection_source,
+                        draft_origin="generated",
+                    )
+                    log.info(f"   📱 New draft ({reflection_source}, {len(reflection)} chars)")
+                else:
+                    log.warning("   📱 Regenerate produced no usable draft — kept previous")
+                    try:
+                        import telegram_notify as tg
+                        tg.set_card_overlay("⚠️ Regenerate failed — kept previous draft")
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"   📱 Regenerate error: {e}")
+                try:
+                    import telegram_notify as tg
+                    tg.set_card_overlay("⚠️ Regenerate failed — kept previous draft")
+                except Exception:
+                    pass
+            self._regen_future = None
+
         if fill_form and page is not None and reflection:
             try:
                 await fill_reflection_textarea(page, reflection)
             except Exception as e:
                 log.warning(f"Telegram form fill skipped: {e}")
-    return reflection, reflection_source
+        return reflection, reflection_source
 
 
 def _telegram_set_lesson_context(
@@ -1856,6 +1973,18 @@ async def reading_phase(
     title, body = await extract_article(page)
     log.info(f"   Article: {title!r}")
     if not body:
+        try:
+            import telegram_notify as tg
+            ctx = tg.get_lesson_context()
+            key = lesson.url.rstrip("/").replace("/reflect", "")
+            if ctx.get("lesson_url", "").rstrip("/").replace("/reflect", "") == key:
+                saved_body = str(ctx.get("article_body") or "").strip()
+                if len(saved_body) > 80:
+                    body = saved_body
+                    log.info(f"   Article body restored from Telegram context ({len(body)} chars)")
+        except Exception:
+            pass
+    if not body:
         body = (
             f"This article covered important topics related to {title}. "
             "It discussed community impact, personal responsibility, and evidence-based approaches."
@@ -1874,6 +2003,8 @@ async def reading_phase(
             _reading_llm_with_persist(lesson, title, title, body, lesson_prompt)
         )
 
+    tg_handler = _TelegramActionHandler()
+
     async def _reading_telegram_hook() -> None:
         nonlocal reflection, reflection_source
         r, s = reflection, reflection_source
@@ -1883,10 +2014,9 @@ async def reading_phase(
                     r, s = llm_task.result()
                 except Exception:
                     pass
-        if not r:
-            return
         reflection, reflection_source = await _handle_telegram_reflection_actions(
             lesson, title, body, lesson_prompt, r, s,
+            handler=tg_handler,
         )
 
     secs = await get_timer(page)
@@ -1993,12 +2123,15 @@ async def reflect_phase(
     if secs > 0:
         log.info(f"   Reflect timer: {secs//60}:{secs%60:02d}")
 
+        tg_reflect_handler = _TelegramActionHandler()
+
         async def _reflect_telegram_hook() -> None:
             nonlocal reflection, reflection_source, filled_len
             reflection, reflection_source = await _handle_telegram_reflection_actions(
                 lesson, art_title, art_body, lesson_prompt,
                 reflection, reflection_source,
                 page=page, fill_form=True,
+                handler=tg_reflect_handler,
             )
 
         await wait_for_timer(

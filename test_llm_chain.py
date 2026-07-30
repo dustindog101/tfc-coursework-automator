@@ -185,6 +185,7 @@ class TestLLMChain(unittest.TestCase):
         prompt = rc.build_reflection_system_prompt("Title", "Body text", "What did you learn?")
         self.assertIn("ONLY the reflection paragraph", prompt)
         self.assertIn("What did you learn?", prompt)
+        self.assertIn("REPLY FORMAT", prompt)
 
     def test_llm_output_rejects_meta_text(self):
         meta = (
@@ -193,6 +194,26 @@ class TestLLMChain(unittest.TestCase):
             "I think the article was helpful and made me think about recovery."
         )
         self.assertTrue(rc._llm_output_is_invalid(meta))
+
+    def test_llm_output_rejects_style_checks_echo(self):
+        bad = (
+            "- **Style checks**: Includes missing apostrophes (`im`, `its`, `u`), "
+            "lowercased start (`relapse`), informal phrasing (`basically`, `u`, `n`), "
+            "no em-dashes, no forbidden buzzwords, answers the prompt directly "
+            "based on the provided text."
+        )
+        self.assertTrue(rc._llm_output_is_invalid(bad))
+        self.assertEqual(rc._extract_prose(bad), "")
+
+    def test_extract_prose_keeps_reflection_after_meta_line(self):
+        mixed = (
+            "Style checks: informal tone\n"
+            "i learned relapse is basically a process not a single moment and "
+            "it made me think about how recovery takes real work every day"
+        )
+        prose = rc._extract_prose(mixed)
+        self.assertTrue(prose.startswith("i learned"))
+        self.assertGreaterEqual(len(prose), rc.REFLECTION_MIN)
 
     def test_needs_llm_recheck(self):
         self.assertTrue(rc.needs_llm_recheck("", ""))

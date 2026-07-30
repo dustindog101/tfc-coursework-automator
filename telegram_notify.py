@@ -47,6 +47,7 @@ _CMD_FOOTER = "<i>Commands: /status · /stats · /help</i>"
 _REFLECTION_PREVIEW_MAX = 600
 _REFLECTION_MIN_CHARS = 80
 _REFLECTION_MAX_CHARS = 295
+_ARTICLE_MSG_MAX = 3800  # Telegram message limit is 4096; leave room for HTML wrapper
 _LESSON_EDIT_INTERVAL_S = int(os.getenv("TELEGRAM_LESSON_EDIT_INTERVAL_S", "60"))
 _last_lesson_card_edit = 0.0
 
@@ -360,7 +361,52 @@ def drain_actions_for_lesson(lesson_url: str) -> list[dict]:
     return taken
 
 
-def _lesson_card_keyboard(phase: str) -> Optional[dict]:
+def _get_card_overlay() -> str:
+    return str(_load_json(PENDING_FILE).get("card_overlay") or "").strip()
+
+
+def set_card_overlay(text: Optional[str]) -> None:
+    """Set a status line on the live lesson card and refresh immediately."""
+    data = _load_json(PENDING_FILE)
+    if text:
+        data["card_overlay"] = str(text)[:200]
+    else:
+        data.pop("card_overlay", None)
+    _save_json(PENDING_FILE, data)
+    refresh_lesson_card(force=True)
+
+
+def clear_card_overlay() -> None:
+    data = _load_json(PENDING_FILE)
+    if "card_overlay" in data:
+        data.pop("card_overlay", None)
+        _save_json(PENDING_FILE, data)
+
+
+def _send_article_message(chat_id: int) -> bool:
+    """Send full article as a separate copy-friendly message (not on the live card)."""
+    ctx = get_lesson_context()
+    body = str(ctx.get("article_body") or "").strip()
+    if not body:
+        return False
+    title = str(ctx.get("article_title") or ctx.get("lesson_title") or "Article")
+    chunks = [body[i : i + _ARTICLE_MSG_MAX] for i in range(0, len(body), _ARTICLE_MSG_MAX)]
+    for idx, chunk in enumerate(chunks):
+        if len(chunks) == 1:
+            header = f"📋 <b>{_esc(title)}</b>"
+            footer = "<i>Tap and hold the text above to copy.</i>"
+        else:
+            header = f"📋 <b>{_esc(title)}</b>  <i>({idx + 1}/{len(chunks)})</i>"
+            footer = (
+                "<i>Tap and hold to copy.</i>"
+                if idx == len(chunks) - 1
+                else "<i>Continued below…</i>"
+            )
+        send_message(chat_id, f"{header}\n\n<pre>{_esc(chunk)}</pre>\n\n{footer}")
+    return True
+
+
+def _lesson_card_keyboard(phase: str, article_body: str = "") -> Optional[dict]:
     """Inline buttons on the live lesson card (reading/reflect only)."""
     if phase not in ("reading", "reflect"):
         return None
@@ -375,15 +421,36 @@ def _lesson_card_keyboard(phase: str) -> Optional[dict]:
     }
 
 
-def _send_article_copy(chat_id: int) -> None:
-    ctx = get_lesson_context()
-    if not ctx.get("article_body"):
-        send_message(chat_id, _card("📋 Article", ["<i>No article text saved for this lesson yet.</i>"]))
+def refresh_lesson_card(*, force: bool = False, phase: Optional[str] = None) -> None:
+    """Rebuild and edit the pinned lesson message from live events."""
+    global _last_lesson_card_edit
+    if not is_enabled() or get_chat_id() is None:
         return
-    title = ctx.get("article_title") or ctx.get("lesson_title") or "Article"
-    body = str(ctx["article_body"])[:3900]
-    plain = f"{title}\n\n{body}"
-    send_message(chat_id, f"<b>{_esc(title)}</b>\n\n<pre>{_esc(body)}</pre>", parse_mode="HTML")
+    if not _load_lesson_msg().get("message_id"):
+        return
+    now = time.time()
+    if not force and now - _last_lesson_card_edit < _LESSON_EDIT_INTERVAL_S:
+        return
+    events = _tail_events()
+    live = _parse_live_state(events)
+    card_phase = phase or live.get("phase") or "reading"
+    if card_phase not in ("reading", "reflect", "starting"):
+        card_phase = "reading" if live.get("lesson_title") else card_phase
+    record = {
+        "lesson_title": live.get("lesson_title"),
+        "article_title": live.get("article_title"),
+        "hours_today": live.get("hours_today"),
+        "hours_done": live.get("hours_done"),
+        "timer_secs": live.get("timer_secs"),
+        "reflection": live.get("reflection"),
+        "source": live.get("reflection_source"),
+        "draft_origin": live.get("reflection_draft_origin"),
+    }
+    _last_lesson_card_edit = now
+    _enqueue_lesson_update(
+        _build_lesson_card_from_record(record, phase=card_phase),
+        phase=card_phase if card_phase in ("reading", "reflect") else None,
+    )
 
 
 def _enqueue_lesson_update(text: str, *, new_lesson: bool = False, phase: Optional[str] = None) -> None:
@@ -393,8 +460,6 @@ def _enqueue_lesson_update(text: str, *, new_lesson: bool = False, phase: Option
     if chat_id is None:
         return
     markup = _lesson_card_keyboard(phase) if phase else None
-    if is_awaiting_custom_reflection() and phase in ("reading", "reflect"):
-        text += "\n\n<i>Waiting for your reflection — send it as the next message (80–295 chars).</i>"
     stored = _load_lesson_msg()
     msg_id = stored.get("message_id")
     if msg_id and not new_lesson:
@@ -777,6 +842,10 @@ def _build_lesson_card(
         lines.append("")
         lines.append(label)
         lines.append(f"<i>{_esc(preview)}</i>")
+    overlay = _get_card_overlay()
+    if overlay:
+        lines.append("")
+        lines.append(f"<b>Status</b>  {_esc(overlay)}")
     if submitted or phase == "submitted":
         lines.append("")
         lines.append("<b>Status</b>  Reflection submitted to site ✓")
@@ -876,6 +945,7 @@ def on_event(record: dict) -> None:
         return
 
     if event == "reflection_generated":
+        clear_card_overlay()
         p = _infer_lesson_phase(record)
         _enqueue_lesson_update(
             _build_lesson_card_from_record(record, phase=p),
@@ -1126,7 +1196,7 @@ def build_help_text() -> str:
             "<b>Live lesson card buttons</b>  (while reading/reflecting, before submit):",
             "  🔄 <b>Regenerate</b> — new AI draft",
             "  ✏️ <b>My own</b> — send your text as the next message",
-            "  📋 <b>Article text</b> — copyable article in a separate message",
+            "  📋 <b>Article text</b> — sends full article in a separate message (tap to copy)",
             "",
             "<b>Live lesson message</b>  One message per article — updates as the bot reads, drafts reflection, and submits",
             "<b>Toggle</b>  Menubar → Settings → Telegram Notifications",
@@ -1162,12 +1232,8 @@ def _handle_user_text(chat_id: int, text: str) -> bool:
         return True
     body = text.strip()
     if len(body) < _REFLECTION_MIN_CHARS:
-        send_message(
-            chat_id,
-            _card(
-                "✏️ Too short",
-                [f"Need at least {_REFLECTION_MIN_CHARS} characters (you sent {len(body)})."],
-            ),
+        set_card_overlay(
+            f"⚠️ Too short ({len(body)} chars) — need {_REFLECTION_MIN_CHARS}–{_REFLECTION_MAX_CHARS}",
         )
         return True
     if len(body) > _REFLECTION_MAX_CHARS:
@@ -1180,16 +1246,7 @@ def _handle_user_text(chat_id: int, text: str) -> bool:
         "text": body,
         "lesson_url": ctx["lesson_url"],
     })
-    send_message(
-        chat_id,
-        _card(
-            "✅ Reflection queued",
-            [
-                f"<b>Length</b>  {len(body)} chars",
-                "<b>Status</b>  Bot will use this before submit (usually within 60s).",
-            ],
-        ),
-    )
+    set_card_overlay(f"✅ Reflection queued ({len(body)} chars) — applying soon…")
     return True
 
 
@@ -1206,8 +1263,8 @@ def _handle_callback(chat_id: int, callback_id: str, data: str) -> None:
             _answer_callback(callback_id, "No active lesson.")
             return
         _queue_action({"type": "regenerate", "lesson_url": lesson_url})
-        _answer_callback(callback_id, "Regenerating draft…")
-        send_message(chat_id, _card("🔄 Regenerate", ["<b>Queued</b>  New AI draft incoming (usually within 60s)."]))
+        _answer_callback(callback_id, "Queued — draft incoming soon.")
+        set_card_overlay("🔄 Queued — new AI draft incoming (usually within 60s).")
         return
 
     if data == "tfc:custom":
@@ -1218,22 +1275,17 @@ def _handle_callback(chat_id: int, callback_id: str, data: str) -> None:
         pending["awaiting_custom"] = True
         _save_json(PENDING_FILE, pending)
         _answer_callback(callback_id, "Send your reflection next.")
-        send_message(
-            chat_id,
-            _card(
-                "✏️ Your reflection",
-                [
-                    f"<b>Lesson</b>  {_esc(ctx.get('lesson_title') or '—')}",
-                    f"Send one message with your reflection ({_REFLECTION_MIN_CHARS}–{_REFLECTION_MAX_CHARS} chars).",
-                    "The bot will use it before submit.",
-                ],
-            ),
+        set_card_overlay(
+            f"✏️ Waiting for your reflection — send one message "
+            f"({_REFLECTION_MIN_CHARS}–{_REFLECTION_MAX_CHARS} chars).",
         )
         return
 
     if data == "tfc:article":
-        _answer_callback(callback_id, "Article sent below.")
-        _send_article_copy(chat_id)
+        if _send_article_message(chat_id):
+            _answer_callback(callback_id, "Article sent — tap to copy.")
+        else:
+            _answer_callback(callback_id, "No article text saved yet.")
         return
 
     _answer_callback(callback_id)

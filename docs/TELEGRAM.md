@@ -48,9 +48,9 @@ The menubar toggle reflects real state (reads `.env` token + linked chat).
 
 | Button | What it does |
 | :--- | :--- |
-| **🔄 Regenerate** | Queue a fresh AI draft (applied within ~60s during the timer) |
-| **✏️ My own** | Send your reflection as the next chat message (80–295 chars) |
-| **📋 Article text** | Article title + copyable body in a **separate message** (not on the live card) |
+| **🔄 Regenerate** | Queues a fresh AI draft — live card shows `Queued…` then updates with the new draft |
+| **✏️ My own** | Send your reflection as the next chat message (80–295 chars) — card shows waiting status |
+| **📋 Article text** | Sends the **full article** in a separate message (`<pre>` block — tap and hold to copy) |
 
 Actions are queued locally; the coursework bot polls during timers. **Telegram errors never stop the bot.**
 
