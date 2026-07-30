@@ -10,6 +10,9 @@ idrive_status.json
 bot.pid
 telegram_config.json
 telegram_settings.json
+telegram_lesson_msg.json
+telegram_lesson_context.json
+telegram_pending.json
 reflection_drafts.json
 events.jsonl
 *.jsonl

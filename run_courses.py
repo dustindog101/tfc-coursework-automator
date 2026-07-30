@@ -32,7 +32,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
@@ -1669,11 +1669,88 @@ async def inspect_lesson(page, lesson: LessonEntry) -> str:
     return "complete"
 
 
+async def _handle_telegram_reflection_actions(
+    lesson: "LessonEntry",
+    art_title: str,
+    art_body: str,
+    lesson_prompt: str,
+    reflection: str,
+    reflection_source: str,
+    *,
+    page=None,
+    fill_form: bool = False,
+) -> tuple[str, str]:
+    """Apply Telegram regenerate/custom actions. Never raises — bot keeps going."""
+    try:
+        import telegram_notify as tg
+        actions = tg.drain_actions_for_lesson(lesson.url)
+    except Exception as e:
+        log.warning(f"Telegram actions skipped: {e}")
+        return reflection, reflection_source
+
+    for action in actions:
+        atype = action.get("type")
+        if atype == "regenerate":
+            log.info("   📱 Telegram: regenerating reflection…")
+            loop = asyncio.get_event_loop()
+            new_r, new_s = await loop.run_in_executor(
+                None, call_agy, art_title, art_body, lesson_prompt,
+            )
+            if new_r and len(new_r.strip()) >= REFLECTION_MIN:
+                reflection, reflection_source = new_r, new_s
+                _persist_reflection_draft(
+                    lesson, art_title, reflection, reflection_source, lesson_prompt,
+                    draft_origin="generated",
+                )
+                log_reflection_generated(
+                    lesson.title, art_title, reflection, reflection_source,
+                    draft_origin="generated",
+                )
+                log.info(f"   📱 New draft ({reflection_source}, {len(reflection)} chars)")
+        elif atype == "custom":
+            text = str(action.get("text", "")).strip()
+            if len(text) >= REFLECTION_MIN:
+                reflection = text[:REFLECTION_MAX]
+                reflection_source = "telegram"
+                _persist_reflection_draft(
+                    lesson, art_title, reflection, reflection_source, lesson_prompt,
+                    draft_origin="loaded",
+                )
+                log.info(f"   📱 Using your Telegram reflection ({len(reflection)} chars)")
+                log_reflection_generated(
+                    lesson.title, art_title, reflection, reflection_source,
+                    draft_origin="loaded",
+                )
+        if fill_form and page is not None and reflection:
+            try:
+                await fill_reflection_textarea(page, reflection)
+            except Exception as e:
+                log.warning(f"Telegram form fill skipped: {e}")
+    return reflection, reflection_source
+
+
+def _telegram_set_lesson_context(
+    lesson: "LessonEntry", article_title: str, article_body: str, lesson_prompt: str = "",
+) -> None:
+    try:
+        import telegram_notify as tg
+        tg.set_lesson_context(
+            lesson_url=lesson.url,
+            lesson_title=lesson.title,
+            article_title=article_title,
+            article_body=article_body,
+            lesson_prompt=lesson_prompt,
+        )
+    except Exception:
+        pass
+
+
 # ── Lesson phases ─────────────────────────────────────────────────────────────
 async def wait_for_timer(
     page, phase: str, lesson_title: str,
     hours_done: float, hours_today: float, hours_total: float,
     rs: Optional[RunState] = None,
+    on_interval: Optional[Callable[[], Awaitable[None]]] = None,
 ):
     """Local wall-clock countdown; resync from page every TIMER_RESYNC_S with scroll."""
     local = LocalTimer()
@@ -1752,6 +1829,11 @@ async def wait_for_timer(
         await asyncio.sleep(LOCAL_TICK_S)
         elapsed += LOCAL_TICK_S
         since_resync += LOCAL_TICK_S
+        if on_interval:
+            try:
+                await on_interval()
+            except Exception as e:
+                log.warning(f"Timer hook skipped: {e}")
 
 
 async def reading_phase(
@@ -1779,9 +1861,12 @@ async def reading_phase(
             "It discussed community impact, personal responsibility, and evidence-based approaches."
         )
     lesson_prompt = default_reflect_prompt(title)
+    _telegram_set_lesson_context(lesson, title, body, lesson_prompt)
 
     saved = _apply_saved_reflection_draft(lesson.url, lesson.title, title)
     llm_task: Optional[asyncio.Task] = None
+    reflection = ""
+    reflection_source = ""
     if saved:
         reflection, reflection_source = saved
     else:
@@ -1789,10 +1874,28 @@ async def reading_phase(
             _reading_llm_with_persist(lesson, title, title, body, lesson_prompt)
         )
 
+    async def _reading_telegram_hook() -> None:
+        nonlocal reflection, reflection_source
+        r, s = reflection, reflection_source
+        if llm_task:
+            if llm_task.done() and not llm_task.cancelled():
+                try:
+                    r, s = llm_task.result()
+                except Exception:
+                    pass
+        if not r:
+            return
+        reflection, reflection_source = await _handle_telegram_reflection_actions(
+            lesson, title, body, lesson_prompt, r, s,
+        )
+
     secs = await get_timer(page)
     if secs > 0:
         log.info(f"   Reading timer: {secs//60}:{secs%60:02d}")
-        await wait_for_timer(page, "READ", title, hours_done, hours_today, hours_total, rs)
+        await wait_for_timer(
+            page, "READ", title, hours_done, hours_today, hours_total, rs,
+            on_interval=_reading_telegram_hook,
+        )
     else:
         log.info("   No reading timer")
 
@@ -1834,6 +1937,7 @@ async def reflect_phase(
 
     lesson_prompt = await extract_reflect_prompt(page, art_title)
     log.info(f"Reflection Prompt Question: {lesson_prompt!r}")
+    _telegram_set_lesson_context(lesson, art_title, art_body, lesson_prompt)
 
     reflection = pre_reflection
     reflection_source = pre_source
@@ -1888,7 +1992,19 @@ async def reflect_phase(
     secs = await get_timer(page)
     if secs > 0:
         log.info(f"   Reflect timer: {secs//60}:{secs%60:02d}")
-        await wait_for_timer(page, "REFLECT", art_title, hours_done, hours_today, hours_total, rs)
+
+        async def _reflect_telegram_hook() -> None:
+            nonlocal reflection, reflection_source, filled_len
+            reflection, reflection_source = await _handle_telegram_reflection_actions(
+                lesson, art_title, art_body, lesson_prompt,
+                reflection, reflection_source,
+                page=page, fill_form=True,
+            )
+
+        await wait_for_timer(
+            page, "REFLECT", art_title, hours_done, hours_today, hours_total, rs,
+            on_interval=_reflect_telegram_hook,
+        )
 
     if needs_llm_recheck(reflection, reflection_source):
         if should_stop_work(rs):
@@ -1947,6 +2063,11 @@ async def reflect_phase(
     if success:
         log.info(f"   ✅ Submitted: {art_title!r}")
         clear_reflection_draft(lesson.url)
+        try:
+            import telegram_notify as tg
+            tg.clear_lesson_context()
+        except Exception:
+            pass
     else:
         log.warning(f"   ⚠️  Submission unconfirmed: {art_title!r}")
 

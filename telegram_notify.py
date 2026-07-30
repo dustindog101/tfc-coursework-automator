@@ -22,6 +22,8 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(ROOT_DIR, "telegram_settings.json")
 CONFIG_FILE = os.path.join(ROOT_DIR, "telegram_config.json")
 LESSON_MSG_FILE = os.path.join(ROOT_DIR, "telegram_lesson_msg.json")
+LESSON_CONTEXT_FILE = os.path.join(ROOT_DIR, "telegram_lesson_context.json")
+PENDING_FILE = os.path.join(ROOT_DIR, "telegram_pending.json")
 EVENTS_FILE = os.getenv("TFC_EVENTS_FILE", os.path.join(ROOT_DIR, "events.jsonl"))
 BOT_PID_FILE = os.path.join(ROOT_DIR, "bot.pid")
 BOT_COMPLETED_FILE = os.path.join(ROOT_DIR, "bot_completed_courses.json")
@@ -43,6 +45,8 @@ _SKIP_PUSH_EVENTS = frozenset({
 
 _CMD_FOOTER = "<i>Commands: /status · /stats · /help</i>"
 _REFLECTION_PREVIEW_MAX = 600
+_REFLECTION_MIN_CHARS = 80
+_REFLECTION_MAX_CHARS = 295
 _LESSON_EDIT_INTERVAL_S = int(os.getenv("TELEGRAM_LESSON_EDIT_INTERVAL_S", "60"))
 _last_lesson_card_edit = 0.0
 
@@ -222,7 +226,10 @@ def _api_request(method: str, payload: dict) -> Optional[dict]:
     return None
 
 
-def send_message(chat_id: int, text: str, *, parse_mode: str = "HTML") -> Optional[int]:
+def send_message(
+    chat_id: int, text: str, *, parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+) -> Optional[int]:
     payload: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -230,6 +237,8 @@ def send_message(chat_id: int, text: str, *, parse_mode: str = "HTML") -> Option
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     result = _api_request("sendMessage", payload)
     if result and result.get("ok"):
         try:
@@ -239,7 +248,10 @@ def send_message(chat_id: int, text: str, *, parse_mode: str = "HTML") -> Option
     return None
 
 
-def edit_message(chat_id: int, message_id: int, text: str, *, parse_mode: str = "HTML") -> bool:
+def edit_message(
+    chat_id: int, message_id: int, text: str, *, parse_mode: str = "HTML",
+    reply_markup: Optional[dict] = None,
+) -> bool:
     payload: dict = {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -248,6 +260,8 @@ def edit_message(chat_id: int, message_id: int, text: str, *, parse_mode: str = 
     }
     if parse_mode:
         payload["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     result = _api_request("editMessageText", payload)
     return bool(result and result.get("ok"))
 
@@ -261,18 +275,132 @@ def notify(text: str) -> None:
     _msg_queue.put(("send", chat_id, text))
 
 
-def _enqueue_lesson_update(text: str, *, new_lesson: bool = False) -> None:
+def _answer_callback(callback_id: str, text: str = "") -> None:
+    payload: dict = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text[:200]
+        payload["show_alert"] = False
+    _api_request("answerCallbackQuery", payload)
+
+
+def set_lesson_context(
+    *,
+    lesson_url: str,
+    lesson_title: str,
+    article_title: str,
+    article_body: str,
+    lesson_prompt: str = "",
+) -> None:
+    """Store article text for Telegram copy/regenerate (not shown on the live card)."""
+    try:
+        _save_json(LESSON_CONTEXT_FILE, {
+            "lesson_url": lesson_url.rstrip("/").replace("/reflect", ""),
+            "lesson_title": lesson_title,
+            "article_title": article_title,
+            "article_body": (article_body or "")[:8000],
+            "lesson_prompt": lesson_prompt,
+            "active": True,
+            "updated_at": datetime.now().isoformat(),
+        })
+        pending = _load_json(PENDING_FILE)
+        pending["awaiting_custom"] = False
+        pending["actions"] = []
+        _save_json(PENDING_FILE, pending)
+    except Exception as exc:
+        _log_throttled(f"set_lesson_context: {exc}")
+
+
+def clear_lesson_context() -> None:
+    try:
+        if os.path.exists(LESSON_CONTEXT_FILE):
+            os.remove(LESSON_CONTEXT_FILE)
+        pending = _load_json(PENDING_FILE)
+        pending["awaiting_custom"] = False
+        pending["actions"] = []
+        _save_json(PENDING_FILE, pending)
+    except Exception:
+        pass
+
+
+def get_lesson_context() -> dict:
+    return _load_json(LESSON_CONTEXT_FILE)
+
+
+def is_awaiting_custom_reflection() -> bool:
+    return bool(_load_json(PENDING_FILE).get("awaiting_custom"))
+
+
+def _queue_action(action: dict) -> None:
+    data = _load_json(PENDING_FILE)
+    actions = data.get("actions")
+    if not isinstance(actions, list):
+        actions = []
+    actions.append({**action, "ts": datetime.now().isoformat()})
+    data["actions"] = actions[-20:]
+    _save_json(PENDING_FILE, data)
+
+
+def drain_actions_for_lesson(lesson_url: str) -> list[dict]:
+    """Pop pending actions for this lesson (bot polls during timers)."""
+    key = lesson_url.rstrip("/").replace("/reflect", "")
+    data = _load_json(PENDING_FILE)
+    actions = data.get("actions")
+    if not isinstance(actions, list):
+        return []
+    kept: list[dict] = []
+    taken: list[dict] = []
+    for action in actions:
+        akey = str(action.get("lesson_url", key)).rstrip("/").replace("/reflect", "")
+        if akey == key:
+            taken.append(action)
+        else:
+            kept.append(action)
+    data["actions"] = kept
+    _save_json(PENDING_FILE, data)
+    return taken
+
+
+def _lesson_card_keyboard(phase: str) -> Optional[dict]:
+    """Inline buttons on the live lesson card (reading/reflect only)."""
+    if phase not in ("reading", "reflect"):
+        return None
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Regenerate", "callback_data": "tfc:regen"},
+                {"text": "✏️ My own", "callback_data": "tfc:custom"},
+            ],
+            [{"text": "📋 Article text", "callback_data": "tfc:article"}],
+        ],
+    }
+
+
+def _send_article_copy(chat_id: int) -> None:
+    ctx = get_lesson_context()
+    if not ctx.get("article_body"):
+        send_message(chat_id, _card("📋 Article", ["<i>No article text saved for this lesson yet.</i>"]))
+        return
+    title = ctx.get("article_title") or ctx.get("lesson_title") or "Article"
+    body = str(ctx["article_body"])[:3900]
+    plain = f"{title}\n\n{body}"
+    send_message(chat_id, f"<b>{_esc(title)}</b>\n\n<pre>{_esc(body)}</pre>", parse_mode="HTML")
+
+
+def _enqueue_lesson_update(text: str, *, new_lesson: bool = False, phase: Optional[str] = None) -> None:
     if not is_enabled():
         return
     chat_id = get_chat_id()
     if chat_id is None:
         return
+    markup = _lesson_card_keyboard(phase) if phase else None
+    if is_awaiting_custom_reflection() and phase in ("reading", "reflect"):
+        text += "\n\n<i>Waiting for your reflection — send it as the next message (80–295 chars).</i>"
     stored = _load_lesson_msg()
     msg_id = stored.get("message_id")
     if msg_id and not new_lesson:
-        _msg_queue.put(("edit", chat_id, int(msg_id), text))
+        _msg_queue.put(("edit", chat_id, int(msg_id), text, markup))
     else:
-        _msg_queue.put(("send_lesson", chat_id, text))
+        _msg_queue.put(("send_lesson", chat_id, text, markup))
 
 
 def _worker() -> None:
@@ -288,15 +416,19 @@ def _worker() -> None:
                 _, chat_id, text = item
                 send_message(int(chat_id), text)
             elif op == "send_lesson":
-                _, chat_id, text = item
-                mid = send_message(int(chat_id), text)
+                _, chat_id, text, markup = item if len(item) > 3 else (*item, None)
+                mid = send_message(int(chat_id), text, reply_markup=markup)
                 if mid:
                     title = _extract_title_from_card(text)
                     _save_lesson_msg(mid, title)
             elif op == "edit":
-                _, chat_id, message_id, text = item
-                if not edit_message(int(chat_id), int(message_id), text):
-                    mid = send_message(int(chat_id), text)
+                if len(item) >= 5:
+                    _, chat_id, message_id, text, markup = item
+                else:
+                    _, chat_id, message_id, text = item
+                    markup = None
+                if not edit_message(int(chat_id), int(message_id), text, reply_markup=markup):
+                    mid = send_message(int(chat_id), text, reply_markup=markup)
                     if mid:
                         title = _extract_title_from_card(text)
                         _save_lesson_msg(mid, title)
@@ -327,7 +459,10 @@ def _maybe_refresh_lesson_card(record: dict, *, phase: Optional[str] = None) -> 
     if card_phase not in ("reading", "reflect"):
         return
     _last_lesson_card_edit = now
-    _enqueue_lesson_update(_build_lesson_card_from_record(record, phase=card_phase))
+    _enqueue_lesson_update(
+        _build_lesson_card_from_record(record, phase=card_phase),
+        phase=card_phase,
+    )
 
 
 def _extract_title_from_card(text: str) -> str:
@@ -729,26 +864,35 @@ def on_event(record: dict) -> None:
         _enqueue_lesson_update(
             _build_lesson_card_from_record(record, phase="starting"),
             new_lesson=True,
+            phase="starting",
         )
         return
 
     if event == "reading_start":
-        _enqueue_lesson_update(_build_lesson_card_from_record(record, phase="reading"))
+        _enqueue_lesson_update(
+            _build_lesson_card_from_record(record, phase="reading"),
+            phase="reading",
+        )
         return
 
     if event == "reflection_generated":
+        p = _infer_lesson_phase(record)
         _enqueue_lesson_update(
-            _build_lesson_card_from_record(record, phase=_infer_lesson_phase(record)),
+            _build_lesson_card_from_record(record, phase=p),
+            phase=p,
         )
         return
 
     if event == "reflect_start":
-        _enqueue_lesson_update(_build_lesson_card_from_record(record, phase="reflect"))
+        _enqueue_lesson_update(
+            _build_lesson_card_from_record(record, phase="reflect"),
+            phase="reflect",
+        )
         return
 
     if event == "reflect_submitted":
         card = _build_lesson_card_from_record(record, phase="submitted")
-        _enqueue_lesson_update(card)
+        _enqueue_lesson_update(card, phase="submitted")
         return
 
     if event == "timer_sync":
@@ -757,6 +901,7 @@ def on_event(record: dict) -> None:
 
     if event == "daily_limit_hit":
         _clear_lesson_msg()
+        clear_lesson_context()
         return
 
     if event == "daily_limit_wait_start":
@@ -791,10 +936,11 @@ def on_event(record: dict) -> None:
         stored = _load_lesson_msg()
         chat_id = get_chat_id()
         if stored.get("message_id") and chat_id:
-            _msg_queue.put(("edit", chat_id, int(stored["message_id"]), complete_card))
+            _msg_queue.put(("edit", chat_id, int(stored["message_id"]), complete_card, None))
         else:
             notify(complete_card)
         _clear_lesson_msg()
+        clear_lesson_context()
         return
 
     msg = event_to_message(record)
@@ -977,6 +1123,11 @@ def build_help_text() -> str:
             "<b>/stats</b>  Total hours, today's bar, completions, ETA",
             "<b>/help</b>  Show this message",
             "",
+            "<b>Live lesson card buttons</b>  (while reading/reflecting, before submit):",
+            "  🔄 <b>Regenerate</b> — new AI draft",
+            "  ✏️ <b>My own</b> — send your text as the next message",
+            "  📋 <b>Article text</b> — copyable article in a separate message",
+            "",
             "<b>Live lesson message</b>  One message per article — updates as the bot reads, drafts reflection, and submits",
             "<b>Toggle</b>  Menubar → Settings → Telegram Notifications",
         ],
@@ -991,10 +1142,101 @@ def build_welcome_text() -> str:
             "One live message per lesson — it updates through:",
             "  📖 Reading → draft reflection → ✍️ Reflect → ✅ Submitted",
             "",
+            "Use the buttons on the lesson card to regenerate, paste your own reflection, or copy article text.",
+            "",
             "Also get alerts for daily limit, errors, and bot start/stop.",
         ],
         footer=False,
     ) + "\n\n" + build_help_text()
+
+
+def _handle_user_text(chat_id: int, text: str) -> bool:
+    """Handle custom reflection text. Returns True if consumed."""
+    if not text or text.strip().startswith("/"):
+        return False
+    if not is_awaiting_custom_reflection():
+        return False
+    ctx = get_lesson_context()
+    if not ctx.get("lesson_url"):
+        send_message(chat_id, _card("✏️ Custom reflection", ["<i>No active lesson — start the bot first.</i>"]))
+        return True
+    body = text.strip()
+    if len(body) < _REFLECTION_MIN_CHARS:
+        send_message(
+            chat_id,
+            _card(
+                "✏️ Too short",
+                [f"Need at least {_REFLECTION_MIN_CHARS} characters (you sent {len(body)})."],
+            ),
+        )
+        return True
+    if len(body) > _REFLECTION_MAX_CHARS:
+        body = body[:_REFLECTION_MAX_CHARS]
+    pending = _load_json(PENDING_FILE)
+    pending["awaiting_custom"] = False
+    _save_json(PENDING_FILE, pending)
+    _queue_action({
+        "type": "custom",
+        "text": body,
+        "lesson_url": ctx["lesson_url"],
+    })
+    send_message(
+        chat_id,
+        _card(
+            "✅ Reflection queued",
+            [
+                f"<b>Length</b>  {len(body)} chars",
+                "<b>Status</b>  Bot will use this before submit (usually within 60s).",
+            ],
+        ),
+    )
+    return True
+
+
+def _handle_callback(chat_id: int, callback_id: str, data: str) -> None:
+    registered = get_chat_id()
+    if registered is not None and chat_id != registered:
+        _answer_callback(callback_id, "Not linked to this bot.")
+        return
+    ctx = get_lesson_context()
+    lesson_url = ctx.get("lesson_url", "")
+
+    if data == "tfc:regen":
+        if not lesson_url:
+            _answer_callback(callback_id, "No active lesson.")
+            return
+        _queue_action({"type": "regenerate", "lesson_url": lesson_url})
+        _answer_callback(callback_id, "Regenerating draft…")
+        send_message(chat_id, _card("🔄 Regenerate", ["<b>Queued</b>  New AI draft incoming (usually within 60s)."]))
+        return
+
+    if data == "tfc:custom":
+        if not lesson_url:
+            _answer_callback(callback_id, "No active lesson.")
+            return
+        pending = _load_json(PENDING_FILE)
+        pending["awaiting_custom"] = True
+        _save_json(PENDING_FILE, pending)
+        _answer_callback(callback_id, "Send your reflection next.")
+        send_message(
+            chat_id,
+            _card(
+                "✏️ Your reflection",
+                [
+                    f"<b>Lesson</b>  {_esc(ctx.get('lesson_title') or '—')}",
+                    f"Send one message with your reflection ({_REFLECTION_MIN_CHARS}–{_REFLECTION_MAX_CHARS} chars).",
+                    "The bot will use it before submit.",
+                ],
+            ),
+        )
+        return
+
+    if data == "tfc:article":
+        _answer_callback(callback_id, "Article sent below.")
+        _send_article_copy(chat_id)
+        return
+
+    _answer_callback(callback_id)
 
 
 def _handle_command(chat_id: int, text: str) -> None:
@@ -1031,7 +1273,7 @@ def _handle_command(chat_id: int, text: str) -> None:
         send_message(chat_id, build_help_text())
 
 
-def _command_listener() -> None:
+def _update_listener() -> None:
     if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
         return
     offset = 0
@@ -1042,24 +1284,38 @@ def _command_listener() -> None:
         result = _api_request("getUpdates", {
             "offset": offset,
             "timeout": 25,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         })
         if not result or not result.get("ok"):
             time.sleep(2)
             continue
         for update in result.get("result", []):
             offset = max(offset, int(update.get("update_id", 0)) + 1)
-            msg = update.get("message") or {}
-            chat = msg.get("chat") or {}
-            chat_id = chat.get("id")
-            text = msg.get("text", "")
-            if chat_id is None or not text:
-                continue
             try:
+                cb = update.get("callback_query") or {}
+                if cb:
+                    chat = (cb.get("message") or {}).get("chat") or {}
+                    chat_id = chat.get("id")
+                    if chat_id is not None:
+                        _handle_callback(
+                            int(chat_id),
+                            str(cb.get("id", "")),
+                            str(cb.get("data", "")),
+                        )
+                    continue
+                msg = update.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                text = msg.get("text", "")
+                if chat_id is None or not text:
+                    continue
+                cid = int(chat_id)
                 if text.strip().startswith("/"):
-                    _handle_command(int(chat_id), text)
+                    _handle_command(cid, text)
+                elif _handle_user_text(cid, text):
+                    pass
             except Exception as exc:
-                _log_throttled(f"Telegram command error: {exc}")
+                _log_throttled(f"Telegram update error: {exc}")
 
 
 def start() -> None:
@@ -1072,4 +1328,4 @@ def start() -> None:
             return
         _started = True
         threading.Thread(target=_worker, name="telegram-worker", daemon=True).start()
-        threading.Thread(target=_command_listener, name="telegram-commands", daemon=True).start()
+        threading.Thread(target=_update_listener, name="telegram-updates", daemon=True).start()

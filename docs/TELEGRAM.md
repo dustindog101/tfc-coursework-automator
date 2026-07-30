@@ -26,8 +26,8 @@ The bot sends **one message per lesson** and **edits it in place** as work progr
 | Step | Message update |
 | :--- | :--- |
 | Lesson starts | New "Current Lesson" card |
-| Reading | Phase 📖 Reading + today's bar + timer (refreshes ~60s) |
-| Reflection drafted | **generated** or **loaded from disk** + preview |
+| Reading | Phase 📖 Reading + today's bar + timer (refreshes ~60s) + inline buttons |
+| Reflection drafted | **generated** / **loaded** / **telegram** (your text) |
 | Reflect phase | Phase ✍️ Reflection + timer |
 | Submitted | "Reflection submitted to site ✓" |
 | Lesson complete | Final summary, then clears for next article |
@@ -43,6 +43,16 @@ Toggle push without removing credentials:
 **Menubar → Settings → Telegram Notifications: ON/OFF**
 
 The menubar toggle reflects real state (reads `.env` token + linked chat).
+
+### Live lesson card buttons (before submit)
+
+| Button | What it does |
+| :--- | :--- |
+| **🔄 Regenerate** | Queue a fresh AI draft (applied within ~60s during the timer) |
+| **✏️ My own** | Send your reflection as the next chat message (80–295 chars) |
+| **📋 Article text** | Article title + copyable body in a **separate message** (not on the live card) |
+
+Actions are queued locally; the coursework bot polls during timers. **Telegram errors never stop the bot.**
 
 ## Commands
 

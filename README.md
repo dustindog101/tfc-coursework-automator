@@ -117,8 +117,8 @@ Get coursework updates on your phone without staring at the terminal.
 | :--- | :--- |
 | Bot started / stopped | Engine online or session summary |
 | **Live lesson message** | **One message per article** — edits in place as the bot progresses |
-| → Reading | Phase + today's bar + timer (updates ~every 60s) |
-| → Reflection draft | Shows **generated** or **loaded from disk** + preview text |
+| → Reading | Phase + today's bar + timer (updates ~every 60s) + **inline buttons** |
+| → Reflection draft | **generated** / **loaded** / **telegram** (your text) |
 | → Reflection | Phase switches to ✍️ Reflection |
 | → Submitted | Marks reflection submitted ✓ |
 | → Lesson complete | Final summary with hours gained |

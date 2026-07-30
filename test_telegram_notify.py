@@ -181,6 +181,44 @@ class TestLiveState(unittest.TestCase):
         self.assertIn("generated", card)
 
 
+class TestTelegramActions(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._orig_pending = tg.PENDING_FILE
+        self._orig_context = tg.LESSON_CONTEXT_FILE
+        tg.PENDING_FILE = os.path.join(self._tmpdir.name, "pending.json")
+        tg.LESSON_CONTEXT_FILE = os.path.join(self._tmpdir.name, "context.json")
+        tg.set_lesson_context(
+            lesson_url="https://example.org/lesson-1",
+            lesson_title="Lesson 1",
+            article_title="Article A",
+            article_body="Body text here",
+            lesson_prompt="What did you learn?",
+        )
+
+    def tearDown(self):
+        tg.PENDING_FILE = self._orig_pending
+        tg.LESSON_CONTEXT_FILE = self._orig_context
+        self._tmpdir.cleanup()
+
+    def test_drain_actions_for_lesson(self):
+        tg._queue_action({"type": "regenerate", "lesson_url": "https://example.org/lesson-1"})
+        taken = tg.drain_actions_for_lesson("https://example.org/lesson-1")
+        self.assertEqual(len(taken), 1)
+        self.assertEqual(taken[0]["type"], "regenerate")
+        self.assertEqual(tg.drain_actions_for_lesson("https://example.org/lesson-1"), [])
+
+    def test_lesson_keyboard_on_reflect(self):
+        kb = tg._lesson_card_keyboard("reflect")
+        self.assertIsNotNone(kb)
+        labels = [b["text"] for row in kb["inline_keyboard"] for b in row]
+        self.assertIn("🔄 Regenerate", labels)
+        self.assertIn("📋 Article text", labels)
+
+    def test_lesson_keyboard_hidden_when_submitted(self):
+        self.assertIsNone(tg._lesson_card_keyboard("submitted"))
+
+
 class TestEnabledGating(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
